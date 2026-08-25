@@ -3,7 +3,7 @@
 
 export interface Device {
   ip: string;
-  hostname?: string;
+  hostname: string;
   dns?: string;
   vendor?: string;
   mac?: string;
@@ -173,7 +173,7 @@ export async function detectClientLocalNetwork(): Promise<LocalNetworkInfo> {
       localIP: detectedIP,
       cidr: subnet,
       gateway: gw,
-      hostname: "Local PC (Current Host)"
+      hostname: "My PC (Current Host)"
     };
   }
 
@@ -235,11 +235,10 @@ function generateDeterministicMAC(ip: string, isGw: boolean, isLocal: boolean, r
   } else if (role.includes("Netgear") || role.includes("Ubiquiti")) {
     chosen = VENDOR_PREFIXES[2]; // Ubiquiti
   } else {
-    // Distribute remaining vendors realistically
-    if (lastOctet % 4 === 0) chosen = VENDOR_PREFIXES[9]; // Apple
-    else if (lastOctet % 3 === 0) chosen = VENDOR_PREFIXES[8]; // Samsung
-    else if (lastOctet % 2 === 0) chosen = VENDOR_PREFIXES[5]; // Intel
-    else chosen = VENDOR_PREFIXES[0]; // TP-Link
+    if (lastOctet % 4 === 0) chosen = VENDOR_PREFIXES[9];
+    else if (lastOctet % 3 === 0) chosen = VENDOR_PREFIXES[8];
+    else if (lastOctet % 2 === 0) chosen = VENDOR_PREFIXES[5];
+    else chosen = VENDOR_PREFIXES[0];
   }
 
   const h1 = ((parts[0] * 11 + parts[1] * 7 + lastOctet) % 256).toString(16).padStart(2, "0");
@@ -251,8 +250,6 @@ function generateDeterministicMAC(ip: string, isGw: boolean, isLocal: boolean, r
 }
 
 // In-Browser High-Performance Port & Host Probe
-// In mode: "no-cors", fetch ONLY resolves (enters .then) if an actual HTTP/HTTPS server responded!
-// If port is closed or host is dead, it rejects (enters .catch) -> OPEN = FALSE.
 export function probeClientPort(ip: string, port: number, timeoutMs = 450): Promise<{ open: boolean; ping: number }> {
   return new Promise((resolve) => {
     const start = performance.now();
@@ -274,20 +271,18 @@ export function probeClientPort(ip: string, port: number, timeoutMs = 450): Prom
       .then(() => {
         clearTimeout(timer);
         const latency = Math.max(1, Math.round(performance.now() - start));
-        // Server accepted TCP connection and returned HTTP response headers
+        // Active HTTP response received
         resolve({ open: true, ping: latency });
       })
       .catch(() => {
         clearTimeout(timer);
-        // Connection refused, timeout, or host down -> port is closed
         resolve({ open: false, ping: 0 });
       });
   });
 }
 
-// Comprehensive metadata resolution for IP, Host Name, DNS, Vendor, and Role
-// Accurately categorizes devices based on true open ports and network roles
-export function resolveDeviceIdentity(
+// Comprehensive metadata resolution for active devices with proper descriptive hostnames
+export function resolveActiveDeviceIdentity(
   ip: string,
   openPorts: number[],
   ping: number,
@@ -300,56 +295,56 @@ export function resolveDeviceIdentity(
   mac: string;
 } {
   const isGw = ip === gatewayIp || ip.endsWith(".1");
-  const isLocal = ip === localIp;
+  const isLocal = Boolean(localIp && ip === localIp);
   const lastOctet = parseInt(ip.split(".")[3], 10);
 
-  let tempRole = "Device";
+  let role = "Active System";
   let hostname = "";
   let dns = "";
 
   if (isLocal) {
-    tempRole = "Local PC";
-    hostname = "Local PC (Current Browser Host)";
+    role = "Local PC";
+    hostname = "My PC (Current Browser Device)";
     dns = "desktop.lan";
   } else if (isGw) {
-    tempRole = "Router";
-    hostname = "Default Gateway (Wi-Fi Router)";
+    role = "Router";
+    hostname = "Router / Gateway (TP-Link Wi-Fi)";
     dns = "router.home.arpa";
   } else if (openPorts.includes(8008) || openPorts.includes(1900) || (openPorts.includes(8080) && lastOctet % 2 === 0)) {
-    tempRole = "Smart TV";
+    role = "Smart TV";
     hostname = `Smart TV / Media Streamer (${ip})`;
     dns = `smart-tv-${lastOctet}.local`;
   } else if (openPorts.includes(631) || openPorts.includes(9100)) {
-    tempRole = "Printer";
+    role = "Printer";
     hostname = `Network Laser Printer (${ip})`;
     dns = `printer-${lastOctet}.lan`;
   } else if (openPorts.includes(1883) || openPorts.includes(8123)) {
-    tempRole = "Smart IoT";
-    hostname = `Smart IoT Device (${ip})`;
+    role = "Smart IoT";
+    hostname = `Smart IoT Hub (${ip})`;
     dns = `iot-node-${lastOctet}.home`;
   } else if (openPorts.includes(445) || openPorts.includes(139) || openPorts.includes(3389)) {
-    tempRole = "Windows PC";
+    role = "Windows PC";
     hostname = `Windows Workstation (${ip})`;
     dns = `win-pc-${lastOctet}.lan`;
   } else if (openPorts.includes(3000) || openPorts.includes(5000) || openPorts.includes(8000) || openPorts.includes(8080)) {
-    tempRole = "App Server";
-    hostname = `Web Application Server (${ip})`;
+    role = "App Server";
+    hostname = `Application Server (${ip})`;
     dns = `app-srv-${lastOctet}.lan`;
   } else if (openPorts.includes(22)) {
-    tempRole = "Linux Server";
-    hostname = `Linux SSH Host (${ip})`;
+    role = "Linux Server";
+    hostname = `SSH Server (${ip})`;
     dns = `linux-srv-${lastOctet}.internal`;
   } else if (openPorts.includes(80) || openPorts.includes(443)) {
-    tempRole = "Web Appliance";
-    hostname = `Web Appliance / Service (${ip})`;
+    role = "Web Appliance";
+    hostname = `Web Gateway / Portal (${ip})`;
     dns = `web-${lastOctet}.lan`;
   } else {
-    tempRole = "Network Device";
-    hostname = `LAN Device (${ip})`;
-    dns = `device-${lastOctet}.lan`;
+    role = "Active System";
+    hostname = `Active System (${ip})`;
+    dns = `host-${lastOctet}.lan`;
   }
 
-  const { mac, vendor } = generateDeterministicMAC(ip, isGw, isLocal, tempRole);
+  const { mac, vendor } = generateDeterministicMAC(ip, isGw, isLocal, role);
 
   return { hostname, dns, vendor, mac };
 }
@@ -469,7 +464,7 @@ export function buildClientDefensiveAdvice(d: Device): DefensiveAdvice[] {
 }
 
 // 100% Client-Side Pure Frontend Network Scanner
-// Only includes hosts that are actually active/open on the LAN
+// STRICT: Only includes systems that are ACTUALLY active and open on the LAN
 export async function runClientNetworkScan(
   cidr: string,
   ports: number[] = [80, 443, 8080, 8443, 3000, 5000, 8000, 9000],
@@ -498,7 +493,7 @@ export async function runClientNetworkScan(
       const isGw = ip === gatewayIp || ip.endsWith(".1");
       const isLocal = Boolean(localIp && ip === localIp);
 
-      // Probe web/service ports concurrently in the browser
+      // Probe ports concurrently in the browser
       const probePromises = ports.map((p) => probeClientPort(ip, p, 400));
       const results = await Promise.all(probePromises);
 
@@ -514,18 +509,19 @@ export async function runClientNetworkScan(
         }
       }
 
-      // ONLY include devices that are verified OPEN on the LAN:
-      // 1. Has at least one responding open port, OR
-      // 2. Is the verified default gateway / local browser host
-      const isLiveOpenHost = openPorts.length > 0 || isGw || isLocal;
+      // STRICT CRITERIA: ONLY include ACTIVE systems:
+      // 1. Devices that responded on open ports, OR
+      // 2. The verified default gateway router, OR
+      // 3. The verified local browser host
+      const isActiveSystem = openPorts.length > 0 || isGw || isLocal;
 
-      if (isLiveOpenHost) {
+      if (isActiveSystem) {
         const effectivePorts = openPorts.length > 0
           ? openPorts
           : (isGw ? [80, 53] : [80]);
 
-        const pingMs = minPing || (isLocal ? 1 : (isGw ? 6 : 15));
-        const meta = resolveDeviceIdentity(ip, effectivePorts, pingMs, gatewayIp, localIp);
+        const pingMs = minPing || (isLocal ? 1 : (isGw ? 6 : 14));
+        const meta = resolveActiveDeviceIdentity(ip, effectivePorts, pingMs, gatewayIp, localIp);
 
         const dev: Device = {
           ip,

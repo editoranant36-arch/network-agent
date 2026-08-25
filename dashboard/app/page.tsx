@@ -238,8 +238,8 @@ export default function Home() {
 
       <section className="panel">
         <div className="panelHead">
-          <h2>Discovered devices</h2>
-          <span>{busy ? `Scanning... (${deviceList.length} discovered)` : `${deviceList.length} hosts discovered`} · click a row for advice</span>
+          <h2>Active LAN Systems</h2>
+          <span>{busy ? `Scanning... (${deviceList.length} active systems discovered)` : `${deviceList.length} active systems discovered`} · click a row for advice</span>
         </div>
         <div className="tableWrap">
           <table>
@@ -310,14 +310,14 @@ export default function Home() {
               {!deviceList.length && !busy && (
                 <tr>
                   <td colSpan={7} className="empty">
-                    No scan results in memory yet. Click &quot;Start scan&quot; above to scan the network.
+                    No active systems found yet. Click &quot;Start scan&quot; above to scan for active devices on your LAN.
                   </td>
                 </tr>
               )}
               {busy && !deviceList.length && (
                 <tr>
                   <td colSpan={7} className="empty" style={{ color: "#62e6a7" }}>
-                    Probing subnet hosts and scanning open ports... live devices will appear here.
+                    Probing subnet hosts for active systems... online devices will appear here automatically.
                   </td>
                 </tr>
               )}

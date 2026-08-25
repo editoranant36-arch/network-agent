@@ -1,0 +1,433 @@
+import os from "node:os";
+import fs from "node:fs";
+import net from "node:net";
+import tls from "node:tls";
+import dns from "node:dns";
+import { exec } from "node:child_process";
+import { promisify } from "node:util";
+
+const execAsync = promisify(exec);
+
+export interface Device {
+  ip: string;
+  hostname?: string;
+  dns?: string;
+  vendor?: string;
+  mac?: string;
+  gateway?: string;
+  reachable: boolean;
+  ping_ms?: number;
+  open_ports: number[];
+  scanned_at?: string;
+}
+
+// Temporary in-memory state for discovered devices on dashboard
+let temporaryMemoryDevices: Device[] = [];
+let lastScanTime: string | null = null;
+
+export function getInMemoryDevices(): { devices: Device[]; last_scan: string | null } {
+  return {
+    devices: temporaryMemoryDevices,
+    last_scan: lastScanTime
+  };
+}
+
+export function clearInMemoryDevices(): void {
+  temporaryMemoryDevices = [];
+  lastScanTime = null;
+}
+
+let macVendorMap: Map<string, string> | null = null;
+
+function loadMacVendors(): Map<string, string> {
+  if (macVendorMap) return macVendorMap;
+  macVendorMap = new Map();
+  const candidatePaths = [
+    "/usr/share/nmap/nmap-mac-prefixes",
+    "/usr/share/wireshark/manuf",
+    "/usr/share/ieee-data/oui.txt"
+  ];
+  for (const p of candidatePaths) {
+    try {
+      if (fs.existsSync(/*turbopackIgnore: true*/ p)) {
+        const content = fs.readFileSync(/*turbopackIgnore: true*/ p, "utf8");
+        const lines = content.split("\n");
+        for (const line of lines) {
+          const trimmed = line.trim();
+          if (!trimmed || trimmed.startsWith("#")) continue;
+          const parts = trimmed.split(/\s+/);
+          if (parts.length >= 2 && parts[0].length === 6) {
+            macVendorMap.set(parts[0].toUpperCase(), parts.slice(1).join(" "));
+          }
+        }
+        if (macVendorMap.size > 0) break;
+      }
+    } catch {}
+  }
+  return macVendorMap;
+}
+
+export function lookupVendor(mac?: string): string {
+  if (!mac) return "";
+  const clean = mac.replace(/[:-]/g, "").toUpperCase();
+  if (clean.length < 6) return "";
+  const map = loadMacVendors();
+  return map.get(clean.substring(0, 6)) || "";
+}
+
+function getLinuxDefaultGateway(): string {
+  try {
+    const route = fs.readFileSync(/*turbopackIgnore: true*/ "/proc/net/route", "utf8");
+    const lines = route.split("\n");
+    for (let i = 1; i < lines.length; i++) {
+      const parts = lines[i].trim().split(/\s+/);
+      if (parts.length >= 3 && parts[1] === "00000000") {
+        const hex = parts[2];
+        if (hex.length === 8) {
+          const b0 = parseInt(hex.substring(6, 8), 16);
+          const b1 = parseInt(hex.substring(4, 6), 16);
+          const b2 = parseInt(hex.substring(2, 4), 16);
+          const b3 = parseInt(hex.substring(0, 2), 16);
+          return `${b0}.${b1}.${b2}.${b3}`;
+        }
+      }
+    }
+  } catch {}
+  return "";
+}
+
+export function getLocalNetworkInfo() {
+  const ifaces = os.networkInterfaces();
+  let localIP = "";
+  let localMAC = "";
+  let localCIDR = "192.168.0.0/24";
+
+  for (const name of Object.keys(ifaces)) {
+    if (name === "lo") continue;
+    const list = ifaces[name] || [];
+    for (const item of list) {
+      if (item.family === "IPv4" && !item.internal) {
+        localIP = item.address;
+        localMAC = item.mac || "";
+        const netmaskParts = item.netmask.split(".").map(Number);
+        let prefix = 0;
+        for (const byte of netmaskParts) {
+          prefix += (byte.toString(2).match(/1/g) || []).length;
+        }
+        const ipParts = item.address.split(".").map(Number);
+        const baseParts = ipParts.map((b, i) => b & netmaskParts[i]);
+        localCIDR = `${baseParts.join(".")}/${prefix}`;
+        break;
+      }
+    }
+    if (localIP) break;
+  }
+
+  const gateway = getLinuxDefaultGateway();
+
+  return {
+    hostname: os.hostname(),
+    os: os.platform(),
+    arch: os.arch(),
+    localIP,
+    mac: localMAC,
+    cidr: localCIDR,
+    gateway: gateway || "192.168.0.1"
+  };
+}
+
+async function scanNetBIOS(cidr: string): Promise<Map<string, { name: string; mac: string }>> {
+  const map = new Map<string, { name: string; mac: string }>();
+  try {
+    const { stdout } = await execAsync(`nbtscan -q -s : ${cidr}`);
+    for (const line of stdout.split("\n")) {
+      const trimmed = line.trim();
+      if (!trimmed) continue;
+      const parts = trimmed.split(":");
+      if (parts.length >= 2) {
+        const ip = parts[0].trim();
+        const name = parts[1].trim();
+        let mac = "";
+        if (parts.length >= 5) {
+          mac = parts.slice(4).join(":").trim().toLowerCase();
+          if (mac.includes("00:00:00:00:00:00")) mac = "";
+        }
+        if (ip && name) {
+          map.set(ip, { name, mac });
+        }
+      }
+    }
+  } catch {}
+  return map;
+}
+
+async function fpingSweep(cidr: string): Promise<Map<string, number>> {
+  const map = new Map<string, number>();
+  try {
+    const { stdout } = await execAsync(`fping -a -e -q -g ${cidr}`);
+    for (const line of stdout.split("\n")) {
+      const trimmed = line.trim();
+      if (!trimmed) continue;
+      const parts = trimmed.split(/\s+/);
+      if (parts.length >= 1 && parts[0]) {
+        const ip = parts[0];
+        let ms = 15;
+        if (parts.length >= 2) {
+          const raw = parts[1].replace(/[()ms ]/g, "");
+          const num = parseFloat(raw);
+          if (!isNaN(num)) ms = Math.round(num);
+        }
+        map.set(ip, ms);
+      }
+    }
+  } catch {}
+  return map;
+}
+
+function readArpTable(): Map<string, string> {
+  const map = new Map<string, string>();
+  try {
+    const content = fs.readFileSync(/*turbopackIgnore: true*/ "/proc/net/arp", "utf8");
+    for (const line of content.split("\n")) {
+      const parts = line.trim().split(/\s+/);
+      if (parts.length >= 4) {
+        const ip = parts[0];
+        const mac = parts[3];
+        if (mac && mac !== "00:00:00:00:00:00" && !ip.includes("IP")) {
+          map.set(ip, mac);
+        }
+      }
+    }
+  } catch {}
+  return map;
+}
+
+function queryTlsCN(ip: string, port: number): Promise<string> {
+  return new Promise((resolve) => {
+    const socket = tls.connect({
+      host: ip,
+      port: port,
+      rejectUnauthorized: false,
+      timeout: 400
+    }, () => {
+      try {
+        const cert = socket.getPeerCertificate();
+        socket.destroy();
+        if (cert && cert.subject && cert.subject.CN) {
+          const cnVal = Array.isArray(cert.subject.CN) ? cert.subject.CN[0] : cert.subject.CN;
+          if (cnVal) return resolve(String(cnVal));
+        }
+        if (cert && cert.subjectaltname) {
+          const san = cert.subjectaltname.split(",")[0]?.replace(/DNS:/g, "").trim();
+          if (san) return resolve(san);
+        }
+      } catch {}
+      resolve("");
+    });
+    socket.on("error", () => resolve(""));
+    socket.on("timeout", () => { socket.destroy(); resolve(""); });
+  });
+}
+
+async function reverseDnsLookup(ip: string): Promise<string> {
+  try {
+    const names = await dns.promises.reverse(ip);
+    if (names && names.length > 0) {
+      const name = names[0].replace(/\.$/, "");
+      if (name && !name.includes("in-addr.arpa")) return name;
+    }
+  } catch {}
+  return "";
+}
+
+function probePort(ip: string, port: number): Promise<{ open: boolean; ping: number }> {
+  return new Promise((resolve) => {
+    const start = Date.now();
+    const socket = net.connect({ host: ip, port: port }, () => {
+      const latency = Date.now() - start;
+      socket.destroy();
+      resolve({ open: true, ping: latency });
+    });
+    socket.setTimeout(350);
+    socket.on("error", () => resolve({ open: false, ping: 0 }));
+    socket.on("timeout", () => { socket.destroy(); resolve({ open: false, ping: 0 }); });
+  });
+}
+
+function generateCIDRIps(cidr: string): string[] {
+  const [baseIp, maskStr] = cidr.split("/");
+  const prefix = parseInt(maskStr || "24", 10);
+  const parts = baseIp.split(".").map(Number);
+  if (parts.length !== 4) return [];
+
+  const ipInt = (parts[0] << 24) | (parts[1] << 16) | (parts[2] << 8) | parts[3];
+  const hostBits = 32 - prefix;
+  const numHosts = Math.pow(2, hostBits);
+  const startIpInt = (ipInt >>> hostBits) << hostBits;
+
+  const result: string[] = [];
+  const start = numHosts > 2 ? 1 : 0;
+  const end = numHosts > 2 ? numHosts - 1 : numHosts;
+
+  for (let i = start; i < end; i++) {
+    const cur = startIpInt + i;
+    const b0 = (cur >>> 24) & 255;
+    const b1 = (cur >>> 16) & 255;
+    const b2 = (cur >>> 8) & 255;
+    const b3 = cur & 255;
+    result.push(`${b0}.${b1}.${b2}.${b3}`);
+  }
+  return result;
+}
+
+export async function runDashboardNetworkScan(cidrInput?: string, portsInput?: number[]): Promise<Device[]> {
+  const netInfo = getLocalNetworkInfo();
+  const cidr = cidrInput || netInfo.cidr || "192.168.0.0/24";
+  const ports = (portsInput && portsInput.length > 0)
+    ? portsInput
+    : [22, 53, 80, 135, 139, 443, 445, 3389, 8080, 8443];
+
+  const allIps = generateCIDRIps(cidr);
+
+  // Parallel Discovery: NetBIOS + Fping
+  const [nbMap, fpingMap] = await Promise.all([
+    scanNetBIOS(cidr),
+    fpingSweep(cidr)
+  ]);
+
+  const arpMap = readArpTable();
+
+  interface HostMeta {
+    pingMS: number;
+    mac?: string;
+    nbName?: string;
+  }
+
+  const liveHosts = new Map<string, HostMeta>();
+
+  for (const [ip, ms] of fpingMap.entries()) {
+    liveHosts.set(ip, { pingMS: ms });
+  }
+
+  for (const [ip, nb] of nbMap.entries()) {
+    const existing = liveHosts.get(ip);
+    if (existing) {
+      existing.nbName = nb.name;
+      if (nb.mac) existing.mac = nb.mac;
+    } else {
+      liveHosts.set(ip, { pingMS: 20, nbName: nb.name, mac: nb.mac });
+    }
+  }
+
+  for (const [ip, mac] of arpMap.entries()) {
+    if (allIps.includes(ip)) {
+      const existing = liveHosts.get(ip);
+      if (existing) {
+        if (!existing.mac) existing.mac = mac;
+      } else {
+        liveHosts.set(ip, { pingMS: 25, mac });
+      }
+    }
+  }
+
+  if (netInfo.gateway && allIps.includes(netInfo.gateway) && !liveHosts.has(netInfo.gateway)) {
+    liveHosts.set(netInfo.gateway, { pingMS: 10 });
+  }
+  if (netInfo.localIP && allIps.includes(netInfo.localIP) && !liveHosts.has(netInfo.localIP)) {
+    liveHosts.set(netInfo.localIP, { pingMS: 1, mac: netInfo.mac });
+  }
+
+  const discoveredDevices: Device[] = [];
+  const concurrency = 32;
+  const queue = [...allIps];
+
+  async function worker() {
+    while (queue.length > 0) {
+      const ip = queue.shift();
+      if (!ip) break;
+
+      const meta = liveHosts.get(ip);
+
+      // Probe ports
+      const portResults = await Promise.all(ports.map(p => probePort(ip, p)));
+      const openPorts: number[] = [];
+      let fastestPing = 0;
+
+      for (let i = 0; i < ports.length; i++) {
+        if (portResults[i].open) {
+          openPorts.push(ports[i]);
+          if (!fastestPing || portResults[i].ping < fastestPing) {
+            fastestPing = portResults[i].ping;
+          }
+        }
+      }
+
+      if (!meta && openPorts.length === 0) {
+        continue;
+      }
+
+      let mac = (meta && meta.mac) || arpMap.get(ip) || "";
+      if (!mac && ip === netInfo.localIP) {
+        mac = netInfo.mac;
+      }
+
+      const vendor = lookupVendor(mac);
+      let pingMS = fastestPing || (meta ? meta.pingMS : 15);
+
+      // Hostname Resolution
+      let hostName = "";
+
+      if (ip === netInfo.localIP || ip === "127.0.0.1") {
+        hostName = `${os.hostname()} (This Device)`;
+      }
+
+      if (!hostName && meta && meta.nbName) {
+        hostName = meta.nbName;
+      }
+
+      if (!hostName) {
+        hostName = await reverseDnsLookup(ip);
+      }
+
+      if (!hostName && (openPorts.includes(443) || openPorts.includes(8443))) {
+        const tlsPort = openPorts.includes(443) ? 443 : 8443;
+        hostName = await queryTlsCN(ip, tlsPort);
+      }
+
+      if (!hostName && ip === netInfo.gateway) {
+        hostName = vendor ? `Gateway / Router (${vendor})` : "Default Gateway / Router";
+      }
+
+      if (!hostName && vendor) {
+        hostName = `${vendor} Device`;
+      }
+
+      discoveredDevices.push({
+        ip,
+        hostname: hostName || undefined,
+        dns: hostName || undefined,
+        vendor: vendor || undefined,
+        mac: mac || undefined,
+        gateway: netInfo.gateway,
+        reachable: true,
+        ping_ms: pingMS,
+        open_ports: openPorts,
+        scanned_at: new Date().toISOString()
+      });
+    }
+  }
+
+  const workers = Array.from({ length: concurrency }, () => worker());
+  await Promise.all(workers);
+
+  discoveredDevices.sort((a, b) => {
+    const numA = a.ip.split(".").map(Number).reduce((acc, oct) => (acc << 8) + oct, 0) >>> 0;
+    const numB = b.ip.split(".").map(Number).reduce((acc, oct) => (acc << 8) + oct, 0) >>> 0;
+    return numA - numB;
+  });
+
+  temporaryMemoryDevices = discoveredDevices;
+  lastScanTime = new Date().toISOString();
+
+  return discoveredDevices;
+}

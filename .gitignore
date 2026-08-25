@@ -1,0 +1,34 @@
+# Dependencies
+node_modules/
+dashboard/node_modules/
+.pnp
+.pnp.js
+
+# Next.js build
+.next/
+dashboard/.next/
+out/
+build/
+dist/
+
+# Rust build
+target/
+scanner-rs/target/
+
+# Go binaries
+agent-go/wifi-agent
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Environment & Local
+.env
+.env*.local
+*.log
+npm-debug.log*
+
+# OS files
+.DS_Store
+Thumbs.db

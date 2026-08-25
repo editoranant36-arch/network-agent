@@ -137,7 +137,6 @@ function loadMacVendors(): Map<string, string> {
   if (macVendorMap) return macVendorMap;
   macVendorMap = new Map();
 
-  // Populate embedded defaults
   for (const [prefix, name] of Object.entries(EMBEDDED_OUI)) {
     macVendorMap.set(prefix, name);
   }
@@ -309,7 +308,7 @@ function queryTlsCN(ip: string, port: number): Promise<string> {
         host: ip,
         port: port,
         rejectUnauthorized: false,
-        timeout: 400
+        timeout: 350
       },
       () => {
         try {
@@ -346,19 +345,35 @@ async function reverseDnsLookup(ip: string): Promise<string> {
   return "";
 }
 
-function probePort(ip: string, port: number): Promise<{ open: boolean; ping: number }> {
+// Deep Ping & Port Connection Check:
+// Measures ping time and detects active responses (including TCP RST / ECONNREFUSED)
+function probeSocketPingAndPort(
+  ip: string,
+  port: number
+): Promise<{ open: boolean; hostReplied: boolean; ping: number }> {
   return new Promise((resolve) => {
     const start = Date.now();
     const socket = net.connect({ host: ip, port: port }, () => {
-      const latency = Date.now() - start;
+      const latency = Math.max(1, Date.now() - start);
       socket.destroy();
-      resolve({ open: true, ping: latency });
+      resolve({ open: true, hostReplied: true, ping: latency });
     });
-    socket.setTimeout(350);
-    socket.on("error", () => resolve({ open: false, ping: 0 }));
+
+    socket.setTimeout(250);
+
+    socket.on("error", (err: any) => {
+      const latency = Math.max(1, Date.now() - start);
+      // ECONNREFUSED means target host is ACTIVE and replied with TCP RST!
+      if (err && err.code === "ECONNREFUSED") {
+        resolve({ open: false, hostReplied: true, ping: latency });
+      } else {
+        resolve({ open: false, hostReplied: false, ping: 0 });
+      }
+    });
+
     socket.on("timeout", () => {
       socket.destroy();
-      resolve({ open: false, ping: 0 });
+      resolve({ open: false, hostReplied: false, ping: 0 });
     });
   });
 }
@@ -389,6 +404,7 @@ function generateCIDRIps(cidr: string): string[] {
   return result;
 }
 
+// Complete Subnet Loop: Checks all IPs 1 to 254 and pings/probes each one
 export async function runDashboardNetworkScan(cidrInput?: string, portsInput?: number[]): Promise<Device[]> {
   const netInfo = getLocalNetworkInfo();
   const cidr = cidrInput || netInfo.cidr || "192.168.0.0/24";
@@ -454,22 +470,31 @@ export async function runDashboardNetworkScan(cidrInput?: string, portsInput?: n
       if (!ip) break;
 
       const meta = liveHosts.get(ip);
+      const isKnownActive = Boolean(meta || ip === netInfo.gateway || ip === netInfo.localIP);
 
-      // Probe ports
-      const portResults = await Promise.all(ports.map((p) => probePort(ip, p)));
+      // Probe ports & ping response
+      const portResults = await Promise.all(ports.map((p) => probeSocketPingAndPort(ip, p)));
       const openPorts: number[] = [];
-      let fastestPing = 0;
+      let minPing = 0;
+      let anyReplyReceived = false;
 
       for (let i = 0; i < ports.length; i++) {
-        if (portResults[i].open) {
+        const r = portResults[i];
+        if (r.open) {
           openPorts.push(ports[i]);
-          if (!fastestPing || portResults[i].ping < fastestPing) {
-            fastestPing = portResults[i].ping;
+        }
+        if (r.hostReplied) {
+          anyReplyReceived = true;
+          if (!minPing || r.ping < minPing) {
+            minPing = r.ping;
           }
         }
       }
 
-      if (!meta && openPorts.length === 0) {
+      // Check if host replied to ping/probe, is in ARP/NetBIOS, or is known active
+      const isActive = isKnownActive || anyReplyReceived || openPorts.length > 0;
+
+      if (!isActive) {
         continue;
       }
 
@@ -479,7 +504,7 @@ export async function runDashboardNetworkScan(cidrInput?: string, portsInput?: n
       }
 
       const vendor = lookupVendor(mac);
-      let pingMS = fastestPing || (meta ? meta.pingMS : 15);
+      let pingMS = minPing || (meta ? meta.pingMS : (ip === netInfo.localIP ? 1 : 15));
 
       // Hostname Resolution
       let hostName = "";

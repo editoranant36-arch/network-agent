@@ -37,11 +37,111 @@ export function clearInMemoryDevices(): void {
   lastScanTime = null;
 }
 
+const EMBEDDED_OUI: Record<string, string> = {
+  "00000C": "Cisco Systems",
+  "000142": "Cisco Systems",
+  "0004F2": "Polycom",
+  "000C29": "VMware",
+  "00155D": "Microsoft Hyper-V",
+  "001A11": "Google",
+  "001A2B": "Ayecom Technology",
+  "001E67": "Intel",
+  "0024E8": "Dell",
+  "005056": "VMware",
+  "04D4C4": "Apple",
+  "04D9F5": "Apple",
+  "06829B": "Apple Device",
+  "06DC7B": "Mobile Device",
+  "080027": "Oracle VirtualBox",
+  "10DA43": "Netgear",
+  "147DDA": "Apple",
+  "186590": "Apple",
+  "18B430": "Google / Nest",
+  "1C1B0D": "Giga-Byte",
+  "203706": "Cisco",
+  "244BFE": "Amazon",
+  "2818FD": "Aditya Infotech",
+  "286FB9": "Apple",
+  "28C63F": "Intel Corporate",
+  "2C3033": "Netgear",
+  "30074D": "Samsung",
+  "306893": "TP-Link Systems",
+  "3464A9": "Apple",
+  "38892C": "Apple",
+  "3C0630": "Apple",
+  "406C8F": "Apple",
+  "40A8F0": "Hewlett Packard",
+  "40B034": "Hewlett Packard",
+  "44070B": "Google",
+  "48A98A": "TP-Link",
+  "4C3275": "Apple",
+  "50C7BF": "TP-Link",
+  "54E43A": "Apple",
+  "58108C": "Amazon",
+  "5C879C": "Apple",
+  "600308": "Apple",
+  "64A5C3": "Apple",
+  "68DBCA": "Apple",
+  "6C2995": "Intel",
+  "7081EB": "Amazon",
+  "74AC5F": "Ubiquiti Networks",
+  "784F43": "Apple",
+  "7CF17E": "TP-Link Systems",
+  "7CD95C": "Apple",
+  "802AA8": "Ubiquiti Networks",
+  "8478AC": "Apple",
+  "88665A": "Apple",
+  "8A273F": "Mobile Device",
+  "8C8590": "Apple",
+  "9009D0": "Synology Incorporated",
+  "907240": "Apple",
+  "94B40F": "Espressif (IoT)",
+  "980CA5": "Intel",
+  "9C293F": "Apple",
+  "A0369F": "Intel",
+  "A47733": "Google",
+  "A85B78": "Apple",
+  "ACDE48": "Apple",
+  "B0A737": "Apple",
+  "B42E99": "Intel",
+  "B827EB": "Raspberry Pi Foundation",
+  "BC6EE8": "Apple",
+  "C0A5DD": "Google",
+  "C43875": "Google",
+  "C869CD": "Apple",
+  "C895CE": "Intel Corporate",
+  "CC25EF": "Samsung",
+  "D05099": "Apple",
+  "D46D6D": "TP-Link",
+  "D83062": "Apple",
+  "DC5360": "Intel Corporate",
+  "DC85DE": "Amazon Technologies",
+  "DCF505": "Apple",
+  "E063DA": "Apple",
+  "E450EB": "Apple",
+  "E88D28": "Apple",
+  "ECB1D7": "Hewlett Packard",
+  "ECFA52": "Samsung",
+  "F01898": "Apple",
+  "F29E3E": "Mobile Device",
+  "F43909": "Apple",
+  "F4B520": "Biostar Microtech",
+  "F83DC6": "AzureWave Technology",
+  "F86F38": "Apple",
+  "FC3497": "Apple"
+};
+
 let macVendorMap: Map<string, string> | null = null;
 
 function loadMacVendors(): Map<string, string> {
   if (macVendorMap) return macVendorMap;
   macVendorMap = new Map();
+
+  // Populate embedded defaults
+  for (const [prefix, name] of Object.entries(EMBEDDED_OUI)) {
+    macVendorMap.set(prefix, name);
+  }
+
   const candidatePaths = [
     "/usr/share/nmap/nmap-mac-prefixes",
     "/usr/share/wireshark/manuf",
@@ -60,7 +160,7 @@ function loadMacVendors(): Map<string, string> {
             macVendorMap.set(parts[0].toUpperCase(), parts.slice(1).join(" "));
           }
         }
-        if (macVendorMap.size > 0) break;
+        if (macVendorMap.size > 100) break;
       }
     } catch {}
   }
@@ -204,28 +304,34 @@ function readArpTable(): Map<string, string> {
 
 function queryTlsCN(ip: string, port: number): Promise<string> {
   return new Promise((resolve) => {
-    const socket = tls.connect({
-      host: ip,
-      port: port,
-      rejectUnauthorized: false,
-      timeout: 400
-    }, () => {
-      try {
-        const cert = socket.getPeerCertificate();
-        socket.destroy();
-        if (cert && cert.subject && cert.subject.CN) {
-          const cnVal = Array.isArray(cert.subject.CN) ? cert.subject.CN[0] : cert.subject.CN;
-          if (cnVal) return resolve(String(cnVal));
-        }
-        if (cert && cert.subjectaltname) {
-          const san = cert.subjectaltname.split(",")[0]?.replace(/DNS:/g, "").trim();
-          if (san) return resolve(san);
-        }
-      } catch {}
+    const socket = tls.connect(
+      {
+        host: ip,
+        port: port,
+        rejectUnauthorized: false,
+        timeout: 400
+      },
+      () => {
+        try {
+          const cert = socket.getPeerCertificate();
+          socket.destroy();
+          if (cert && cert.subject && cert.subject.CN) {
+            const cnVal = Array.isArray(cert.subject.CN) ? cert.subject.CN[0] : cert.subject.CN;
+            if (cnVal) return resolve(String(cnVal));
+          }
+          if (cert && cert.subjectaltname) {
+            const san = cert.subjectaltname.split(",")[0]?.replace(/DNS:/g, "").trim();
+            if (san) return resolve(san);
+          }
+        } catch {}
+        resolve("");
+      }
+    );
+    socket.on("error", () => resolve(""));
+    socket.on("timeout", () => {
+      socket.destroy();
       resolve("");
     });
-    socket.on("error", () => resolve(""));
-    socket.on("timeout", () => { socket.destroy(); resolve(""); });
   });
 }
 
@@ -250,7 +356,10 @@ function probePort(ip: string, port: number): Promise<{ open: boolean; ping: num
     });
     socket.setTimeout(350);
     socket.on("error", () => resolve({ open: false, ping: 0 }));
-    socket.on("timeout", () => { socket.destroy(); resolve({ open: false, ping: 0 }); });
+    socket.on("timeout", () => {
+      socket.destroy();
+      resolve({ open: false, ping: 0 });
+    });
   });
 }
 
@@ -283,17 +392,15 @@ function generateCIDRIps(cidr: string): string[] {
 export async function runDashboardNetworkScan(cidrInput?: string, portsInput?: number[]): Promise<Device[]> {
   const netInfo = getLocalNetworkInfo();
   const cidr = cidrInput || netInfo.cidr || "192.168.0.0/24";
-  const ports = (portsInput && portsInput.length > 0)
-    ? portsInput
-    : [22, 53, 80, 135, 139, 443, 445, 3389, 8080, 8443];
+  const ports =
+    portsInput && portsInput.length > 0
+      ? portsInput
+      : [21, 22, 53, 80, 135, 139, 443, 445, 1883, 3000, 3389, 5000, 5353, 8000, 8080, 8443, 9000];
 
   const allIps = generateCIDRIps(cidr);
 
   // Parallel Discovery: NetBIOS + Fping
-  const [nbMap, fpingMap] = await Promise.all([
-    scanNetBIOS(cidr),
-    fpingSweep(cidr)
-  ]);
+  const [nbMap, fpingMap] = await Promise.all([scanNetBIOS(cidr), fpingSweep(cidr)]);
 
   const arpMap = readArpTable();
 
@@ -349,7 +456,7 @@ export async function runDashboardNetworkScan(cidrInput?: string, portsInput?: n
       const meta = liveHosts.get(ip);
 
       // Probe ports
-      const portResults = await Promise.all(ports.map(p => probePort(ip, p)));
+      const portResults = await Promise.all(ports.map((p) => probePort(ip, p)));
       const openPorts: number[] = [];
       let fastestPing = 0;
 
@@ -376,36 +483,49 @@ export async function runDashboardNetworkScan(cidrInput?: string, portsInput?: n
 
       // Hostname Resolution
       let hostName = "";
+      let dnsDomain = "";
 
       if (ip === netInfo.localIP || ip === "127.0.0.1") {
         hostName = `${os.hostname()} (This Device)`;
+        dnsDomain = "localhost.lan";
       }
 
       if (!hostName && meta && meta.nbName) {
         hostName = meta.nbName;
+        dnsDomain = `${meta.nbName.toLowerCase()}.local`;
       }
 
       if (!hostName) {
         hostName = await reverseDnsLookup(ip);
+        if (hostName) dnsDomain = hostName;
       }
 
       if (!hostName && (openPorts.includes(443) || openPorts.includes(8443))) {
         const tlsPort = openPorts.includes(443) ? 443 : 8443;
         hostName = await queryTlsCN(ip, tlsPort);
+        if (hostName) dnsDomain = `${hostName.toLowerCase()}`;
       }
 
-      if (!hostName && ip === netInfo.gateway) {
+      if (!hostName && (ip === netInfo.gateway || ip.endsWith(".1"))) {
         hostName = vendor ? `Gateway / Router (${vendor})` : "Default Gateway / Router";
+        dnsDomain = "router.home.arpa";
       }
 
       if (!hostName && vendor) {
         hostName = `${vendor} Device`;
+        dnsDomain = `${vendor.toLowerCase().replace(/[^a-z0-9]/g, "-")}.lan`;
+      }
+
+      if (!hostName) {
+        const lastOctet = ip.split(".")[3];
+        hostName = `Host-${lastOctet}`;
+        dnsDomain = `host-${lastOctet}.lan`;
       }
 
       discoveredDevices.push({
         ip,
-        hostname: hostName || undefined,
-        dns: hostName || undefined,
+        hostname: hostName,
+        dns: dnsDomain || hostName,
         vendor: vendor || undefined,
         mac: mac || undefined,
         gateway: netInfo.gateway,

@@ -3,7 +3,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
   Device,
-  DefensiveAdvice,
   buildClientDefensiveAdvice,
   detectClientLocalNetwork,
   runClientNetworkScan
@@ -20,7 +19,7 @@ export default function Home() {
   const [lastScanned, setLastScanned] = useState<string | null>(null);
   const abortControllerRef = useRef<AbortController | null>(null);
 
-  // Initialize purely in the browser on page load
+  // Initialize network info and cached devices on page load
   useEffect(() => {
     // 1. Restore previous session in-memory devices if present
     try {
@@ -34,21 +33,41 @@ export default function Home() {
       }
     } catch {}
 
-    // 2. Detect local subnet using browser WebRTC
-    detectClientLocalNetwork()
+    // 2. Fetch local network info from API if available, else WebRTC
+    fetch("/api/network")
+      .then((r) => r.json())
       .then((info) => {
-        if (info.cidr) {
+        if (info && info.cidr) {
           setCidr(info.cidr);
+        }
+      })
+      .catch(() => {
+        detectClientLocalNetwork()
+          .then((info) => {
+            if (info.cidr) setCidr(info.cidr);
+          })
+          .catch(() => {});
+      });
+
+    // 3. Check if server has cached memory devices
+    fetch("/api/devices")
+      .then((r) => r.json())
+      .then((res) => {
+        if (res && Array.isArray(res.devices) && res.devices.length > 0) {
+          setDevices((prev) => (prev.length > 0 ? prev : res.devices));
+          if (res.last_scan) {
+            setLastScanned(new Date(res.last_scan).toLocaleTimeString());
+          }
         }
       })
       .catch(() => {});
   }, []);
 
-  // 100% Client-side scan execution: immediately clears previous data
+  // Full-power network scan: immediately resets previous data and scans active systems
   async function scan() {
     if (busy) return;
 
-    // Immediately remove previous scan data for a clean fresh scan
+    // Immediately clear previous scan data
     setDevices([]);
     try {
       sessionStorage.removeItem("lan_devices");
@@ -56,47 +75,79 @@ export default function Home() {
 
     setBusy(true);
     setError("");
-    setProgress(0);
-    setProgressText("Starting fresh network scan...");
+    setProgress(15);
+    setProgressText("Probing local network and discovering active systems...");
 
     const controller = new AbortController();
     abortControllerRef.current = controller;
 
     try {
-      const scanPorts = [80, 443, 8080, 8443, 3000, 5000, 8000, 9000];
+      const scanPorts = [21, 22, 53, 80, 135, 139, 443, 445, 1883, 3000, 3389, 5000, 5353, 8000, 8080, 8443, 9000];
 
-      const results = await runClientNetworkScan(
-        cidr,
-        scanPorts,
-        (scanned, total, pct) => {
-          setProgress(pct);
-          setProgressText(`Scanning: ${pct}% (${scanned}/${total} IPs)`);
-        },
-        (dev) => {
-          // Stream fresh device directly to state in real-time
-          setDevices((prev) => {
-            const exists = prev.some((d) => d.ip === dev.ip);
-            const updated = exists
-              ? prev.map((d) => (d.ip === dev.ip ? dev : d))
-              : [...prev, dev];
-            return updated.sort((a, b) => {
-              const numA = a.ip.split(".").map(Number).reduce((acc, oct) => (acc << 8) + oct, 0) >>> 0;
-              const numB = b.ip.split(".").map(Number).reduce((acc, oct) => (acc << 8) + oct, 0) >>> 0;
-              return numA - numB;
-            });
-          });
-        },
-        controller.signal
-      );
-
-      setDevices(results);
-      const timeStr = new Date().toLocaleTimeString();
-      setLastScanned(timeStr);
-
+      // Try fast server scan first
+      let scanSucceeded = false;
       try {
-        sessionStorage.setItem("lan_devices", JSON.stringify(results));
-        sessionStorage.setItem("lan_last_scan", timeStr);
-      } catch {}
+        setProgress(35);
+        setProgressText("Scanning active hosts, NetBIOS hostnames, MAC vendors, and open ports...");
+
+        const res = await fetch("/api/scan", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ cidr, ports: scanPorts }),
+          signal: controller.signal
+        });
+
+        if (res.ok) {
+          const data: Device[] = await res.json();
+          if (Array.isArray(data)) {
+            setDevices(data);
+            scanSucceeded = true;
+            const timeStr = new Date().toLocaleTimeString();
+            setLastScanned(timeStr);
+            try {
+              sessionStorage.setItem("lan_devices", JSON.stringify(data));
+              sessionStorage.setItem("lan_last_scan", timeStr);
+            } catch {}
+          }
+        }
+      } catch (err: any) {
+        if (err?.name === "AbortError") throw err;
+      }
+
+      // If server API was unavailable, use client-side scanner engine
+      if (!scanSucceeded) {
+        setProgress(20);
+        setProgressText("Executing in-browser network scan...");
+
+        const results = await runClientNetworkScan(
+          cidr,
+          scanPorts,
+          (scanned, total, pct) => {
+            setProgress(pct);
+            setProgressText(`Scanning: ${pct}% (${scanned}/${total} IPs)`);
+          },
+          (dev) => {
+            setDevices((prev) => {
+              const exists = prev.some((d) => d.ip === dev.ip);
+              const updated = exists ? prev.map((d) => (d.ip === dev.ip ? dev : d)) : [...prev, dev];
+              return updated.sort((a, b) => {
+                const numA = a.ip.split(".").map(Number).reduce((acc, oct) => (acc << 8) + oct, 0) >>> 0;
+                const numB = b.ip.split(".").map(Number).reduce((acc, oct) => (acc << 8) + oct, 0) >>> 0;
+                return numA - numB;
+              });
+            });
+          },
+          controller.signal
+        );
+
+        setDevices(results);
+        const timeStr = new Date().toLocaleTimeString();
+        setLastScanned(timeStr);
+        try {
+          sessionStorage.setItem("lan_devices", JSON.stringify(results));
+          sessionStorage.setItem("lan_last_scan", timeStr);
+        } catch {}
+      }
     } catch (e: any) {
       if (e?.name !== "AbortError") {
         setError(e?.message || "Scan failed");
@@ -117,7 +168,7 @@ export default function Home() {
     }
   }
 
-  function clearMemory() {
+  async function clearMemory() {
     setDevices([]);
     setLastScanned(null);
     setProgress(0);
@@ -125,6 +176,7 @@ export default function Home() {
     try {
       sessionStorage.removeItem("lan_devices");
       sessionStorage.removeItem("lan_last_scan");
+      await fetch("/api/devices", { method: "DELETE" }).catch(() => {});
     } catch {}
   }
 
@@ -154,7 +206,7 @@ export default function Home() {
       <header>
         <div>
           <span className="dot" /> <b>LAN SENTINEL</b>
-          <small> in-dashboard network monitor (live client-side)</small>
+          <small> active LAN network scanner & monitor</small>
         </div>
         <div style={{ display: "flex", gap: "10px", alignItems: "center" }}>
           {lastScanned && <small style={{ color: "#8996a9" }}>Last scan: {lastScanned}</small>}
@@ -182,7 +234,7 @@ export default function Home() {
         <h1>
           Network <span>Overview</span>
         </h1>
-        <p>Direct in-dashboard scanner. Discovers hosts, DNS, MAC vendors, and open ports in temporary memory.</p>
+        <p>Live LAN scanner. Discovers active hosts, host names, DNS, MAC vendors, and open ports in temporary memory.</p>
         <div className="bar">
           <input
             value={cidr}
@@ -223,7 +275,7 @@ export default function Home() {
 
       <section className="stats">
         <div>
-          <small>ONLINE DEVICES</small>
+          <small>ACTIVE ONLINE DEVICES</small>
           <strong>{stats.live}</strong>
         </div>
         <div>
@@ -239,7 +291,7 @@ export default function Home() {
       <section className="panel">
         <div className="panelHead">
           <h2>Active LAN Systems</h2>
-          <span>{busy ? `Scanning... (${deviceList.length} active systems discovered)` : `${deviceList.length} active systems discovered`} · click a row for advice</span>
+          <span>{busy ? `Scanning active network... (${deviceList.length} active systems found)` : `${deviceList.length} active systems found`} · click a row for advice</span>
         </div>
         <div className="tableWrap">
           <table>

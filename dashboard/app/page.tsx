@@ -9,9 +9,21 @@ import {
   runClientNetworkScan
 } from "./lib/clientScanner";
 
+interface AgentStatus {
+  status: string;
+  engine: string;
+  hostname: string;
+  os: string;
+  arch: string;
+  uptimeSeconds?: number;
+  goAgentOnline?: boolean;
+  netlensAgentOnline?: boolean;
+}
+
 export default function Home() {
   const [cidr, setCidr] = useState("192.168.0.0/24");
   const [profile, setProfile] = useState<NetworkProfile | null>(null);
+  const [agentStatus, setAgentStatus] = useState<AgentStatus | null>(null);
   const [devices, setDevices] = useState<Device[]>([]);
   const [busy, setBusy] = useState(false);
   const [progress, setProgress] = useState(0);
@@ -20,9 +32,10 @@ export default function Home() {
   const [selected, setSelected] = useState<Device | null>(null);
   const [lastScanned, setLastScanned] = useState<string | null>(null);
   const abortControllerRef = useRef<AbortController | null>(null);
+  const eventSourceRef = useRef<EventSource | null>(null);
   const autoScanTriggeredRef = useRef(false);
 
-  // Initialize network info and auto-detect Wi-Fi type (Personal vs Public)
+  // Initialize network info and auto-detect Wi-Fi type from Backend Agent
   useEffect(() => {
     // 1. Restore previous session in-memory devices if present
     try {
@@ -36,34 +49,34 @@ export default function Home() {
       }
     } catch {}
 
-    // 2. Fetch network profile & Wi-Fi configuration from API, fallback to browser
+    // 2. Fetch Backend Agent Status
+    fetch("/api/agent/status")
+      .then((r) => r.json())
+      .then((statusData: AgentStatus) => {
+        setAgentStatus(statusData);
+      })
+      .catch(() => {});
+
+    // 3. Fetch Real System Network Profile from Backend Agent
     fetch("/api/network")
       .then((r) => r.json())
       .then((netProfile: NetworkProfile) => {
-        if (netProfile) {
+        if (netProfile && netProfile.cidr) {
           setProfile(netProfile);
-          if (netProfile.cidr) setCidr(netProfile.cidr);
-          // Auto-trigger scan if no devices yet
+          setCidr(netProfile.cidr);
           if (!autoScanTriggeredRef.current) {
             autoScanTriggeredRef.current = true;
             triggerAutoScan(netProfile.cidr);
           }
+        } else {
+          fallbackClientDetection();
         }
       })
       .catch(() => {
-        detectBrowserNetworkProfile()
-          .then((bProfile) => {
-            setProfile(bProfile);
-            if (bProfile.cidr) setCidr(bProfile.cidr);
-            if (!autoScanTriggeredRef.current) {
-              autoScanTriggeredRef.current = true;
-              triggerAutoScan(bProfile.cidr);
-            }
-          })
-          .catch(() => {});
+        fallbackClientDetection();
       });
 
-    // 3. Load any active devices in memory from backend
+    // 4. Load any active devices from backend memory
     fetch("/api/devices")
       .then((r) => r.json())
       .then((res) => {
@@ -77,11 +90,24 @@ export default function Home() {
       .catch(() => {});
   }, []);
 
+  function fallbackClientDetection() {
+    detectBrowserNetworkProfile()
+      .then((bProfile) => {
+        setProfile((prev) => prev || bProfile);
+        if (bProfile.cidr) setCidr((prev) => (prev === "192.168.0.0/24" ? bProfile.cidr : prev));
+        if (!autoScanTriggeredRef.current) {
+          autoScanTriggeredRef.current = true;
+          triggerAutoScan(bProfile.cidr);
+        }
+      })
+      .catch(() => {});
+  }
+
   function triggerAutoScan(targetCidr?: string) {
     executeScan(targetCidr || cidr);
   }
 
-  // Complete Network Scan: Sweeps all IPs 1-254, checks ping replies, and displays all active systems
+  // Backend-Powered Complete Network Scan with Real-Time Event Streaming
   async function executeScan(targetCidr: string) {
     if (busy) return;
 
@@ -93,69 +119,160 @@ export default function Home() {
 
     setBusy(true);
     setError("");
-    setProgress(15);
-    setProgressText(`Auto-analyzing ${profile?.ssid || "Wi-Fi"} network and sweeping IPs...`);
+    setProgress(5);
+    setProgressText(`Connecting to Backend Agent & analyzing ${profile?.ssid || "network"}...`);
 
     const controller = new AbortController();
     abortControllerRef.current = controller;
 
-    const scanPorts = [21, 22, 53, 80, 135, 139, 443, 445, 1883, 3000, 3389, 5000, 5353, 8000, 8080, 8443, 9000];
-
+    // Try backend streaming scan via SSE first
     try {
-      let results: Device[] = [];
+      let streamSucceeded = false;
+      const discoveredMap = new Map<string, Device>();
 
-      setProgress(35);
-      setProgressText("Scanning active hosts, NetBIOS names, MAC vendors, and open ports...");
+      const streamUrl = `/api/scan/stream?cidr=${encodeURIComponent(targetCidr)}`;
+      const eventSource = new EventSource(streamUrl);
+      eventSourceRef.current = eventSource;
 
-      try {
-        const res = await fetch("/api/scan", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ cidr: targetCidr, ports: scanPorts }),
-          signal: controller.signal
+      await new Promise<void>((resolve, reject) => {
+        eventSource.addEventListener("status", (e: any) => {
+          try {
+            const data = JSON.parse(e.data);
+            setProgressText(data.message || "Backend Agent sweeping subnet...");
+            setProgress((p) => Math.max(p, 10));
+          } catch {}
         });
 
-        if (res.ok) {
-          const data: Device[] = await res.json();
-          if (Array.isArray(data) && data.length > 0) {
-            results = data;
-          }
-        }
-      } catch (err: any) {
-        if (err?.name === "AbortError") throw err;
-      }
-
-      // If backend API was unreachable (e.g. static CDN host), run in-browser client scanner
-      if (results.length === 0) {
-        setProgress(25);
-        setProgressText("Probing local Wi-Fi subnet directly in browser...");
-
-        results = await runClientNetworkScan(
-          targetCidr,
-          scanPorts,
-          (scanned, total, pct) => {
+        eventSource.addEventListener("progress", (e: any) => {
+          try {
+            const data = JSON.parse(e.data);
+            const pct = data.percentage || Math.round((data.scanned / data.total) * 100);
             setProgress(pct);
-            setProgressText(`Scanning subnet IPs: ${pct}% (${scanned}/${total} IPs)`);
-          },
-          (dev) => {
-            setDevices((prev) => {
-              const exists = prev.some((d) => d.ip === dev.ip);
-              const updated = exists ? prev.map((d) => (d.ip === dev.ip ? dev : d)) : [...prev, dev];
-              return updated.sort((a, b) => {
-                const numA = a.ip.split(".").map(Number).reduce((acc, oct) => (acc << 8) + oct, 0) >>> 0;
-                const numB = b.ip.split(".").map(Number).reduce((acc, oct) => (acc << 8) + oct, 0) >>> 0;
-                return numA - numB;
-              });
+            const currentIpText = data.currentIp ? ` · Probing ${data.currentIp}` : "";
+            setProgressText(`Backend Agent sweeping subnet: ${pct}% (${data.scanned}/${data.total} IPs)${currentIpText}`);
+          } catch {}
+        });
+
+        eventSource.addEventListener("device", (e: any) => {
+          try {
+            const dev: Device = JSON.parse(e.data);
+            discoveredMap.set(dev.ip, dev);
+            const sorted = Array.from(discoveredMap.values()).sort((a, b) => {
+              const numA = a.ip.split(".").map(Number).reduce((acc, oct) => (acc << 8) + oct, 0) >>> 0;
+              const numB = b.ip.split(".").map(Number).reduce((acc, oct) => (acc << 8) + oct, 0) >>> 0;
+              return numA - numB;
             });
-          },
-          controller.signal
-        );
+            setDevices(sorted);
+          } catch {}
+        });
+
+        eventSource.addEventListener("complete", (e: any) => {
+          streamSucceeded = true;
+          eventSource.close();
+          eventSourceRef.current = null;
+          try {
+            const data = JSON.parse(e.data);
+            if (Array.isArray(data.devices)) {
+              setDevices(data.devices);
+              const timeStr = new Date().toLocaleTimeString();
+              setLastScanned(timeStr);
+              try {
+                sessionStorage.setItem("lan_devices", JSON.stringify(data.devices));
+                sessionStorage.setItem("lan_last_scan", timeStr);
+              } catch {}
+            }
+          } catch {}
+          resolve();
+        });
+
+        eventSource.addEventListener("error", () => {
+          eventSource.close();
+          eventSourceRef.current = null;
+          if (!streamSucceeded) {
+            reject(new Error("SSE Stream closed or failed"));
+          } else {
+            resolve();
+          }
+        });
+
+        // Timeout fallback for stream initialization
+        setTimeout(() => {
+          if (!streamSucceeded && discoveredMap.size === 0 && progress <= 10) {
+            eventSource.close();
+            eventSourceRef.current = null;
+            reject(new Error("Stream timeout"));
+          }
+        }, 15000);
+      });
+
+      if (streamSucceeded) {
+        setProgress(100);
+        setProgressText("Scan completed successfully by Backend Agent");
+        setBusy(false);
+        return;
       }
+    } catch {
+      // Stream failed or unsupported, fallback to POST /api/scan
+    }
+
+    // Fallback 1: Backend POST /api/scan
+    try {
+      setProgress(30);
+      setProgressText("Executing direct backend agent scan via /api/scan...");
+
+      const scanRes = await fetch("/api/scan", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ cidr: targetCidr }),
+        signal: controller.signal
+      });
+
+      if (scanRes.ok) {
+        const results: Device[] = await scanRes.json();
+        setDevices(results);
+        const timeStr = new Date().toLocaleTimeString();
+        setLastScanned(timeStr);
+        try {
+          sessionStorage.setItem("lan_devices", JSON.stringify(results));
+          sessionStorage.setItem("lan_last_scan", timeStr);
+        } catch {}
+        setProgress(100);
+        setProgressText("Backend scan completed successfully");
+        setBusy(false);
+        return;
+      }
+    } catch {}
+
+    // Fallback 2: In-browser Client Scanner (if deployed statically or server API unavailable)
+    try {
+      setProgress(25);
+      setProgressText("Probing subnet directly via client engine...");
+      const scanPorts = [21, 22, 53, 80, 135, 139, 443, 445, 1883, 3000, 3389, 5000, 5353, 8000, 8080, 8443, 9000];
+
+      const results = await runClientNetworkScan(
+        targetCidr,
+        scanPorts,
+        (scanned, total, pct) => {
+          setProgress(pct);
+          setProgressText(`Scanning subnet IPs: ${pct}% (${scanned}/${total} IPs)`);
+        },
+        (dev) => {
+          setDevices((prev) => {
+            const exists = prev.some((d) => d.ip === dev.ip);
+            const updated = exists ? prev.map((d) => (d.ip === dev.ip ? dev : d)) : [...prev, dev];
+            return updated.sort((a, b) => {
+              const numA = a.ip.split(".").map(Number).reduce((acc, oct) => (acc << 8) + oct, 0) >>> 0;
+              const numB = b.ip.split(".").map(Number).reduce((acc, oct) => (acc << 8) + oct, 0) >>> 0;
+              return numA - numB;
+            });
+          });
+        },
+        controller.signal
+      );
 
       setDevices(results);
       const timeStr = new Date().toLocaleTimeString();
       setLastScanned(timeStr);
-
       try {
         sessionStorage.setItem("lan_devices", JSON.stringify(results));
         sessionStorage.setItem("lan_last_scan", timeStr);
@@ -176,12 +293,16 @@ export default function Home() {
   }
 
   function stopScan() {
+    if (eventSourceRef.current) {
+      eventSourceRef.current.close();
+      eventSourceRef.current = null;
+    }
     if (abortControllerRef.current) {
       abortControllerRef.current.abort();
       abortControllerRef.current = null;
-      setBusy(false);
-      setProgressText("Scan stopped by user");
     }
+    setBusy(false);
+    setProgressText("Scan stopped by user");
   }
 
   async function clearMemory() {
@@ -249,11 +370,30 @@ export default function Home() {
   return (
     <main>
       <header>
-        <div>
-          <span className="dot" /> <b>LAN SENTINEL</b>
-          <small> intelligent Wi-Fi auto-detection & security monitor</small>
+        <div style={{ display: "flex", alignItems: "center", gap: "12px", flexWrap: "wrap" }}>
+          <div>
+            <span className="dot" /> <b>LAN SENTINEL</b>
+            <small> intelligent Wi-Fi auto-detection & security monitor</small>
+          </div>
+          <div
+            style={{
+              background: "#122017",
+              border: "1px solid #1e5430",
+              color: "#4ade80",
+              borderRadius: "14px",
+              padding: "3px 10px",
+              fontSize: "11px",
+              fontWeight: 600,
+              display: "flex",
+              alignItems: "center",
+              gap: "6px"
+            }}
+          >
+            <span style={{ display: "inline-block", width: "6px", height: "6px", borderRadius: "50%", background: "#4ade80" }} />
+            {agentStatus?.engine || "Backend Agent Online"}
+          </div>
         </div>
-        <div style={{ display: "flex", gap: "10px", alignItems: "center" }}>
+        <div style={{ display: "flex", gap: "10px", alignItems: "center", flexWrap: "wrap" }}>
           {lastScanned && <small style={{ color: "#8996a9" }}>Last scan: {lastScanned}</small>}
           {deviceList.length > 0 && (
             <>
@@ -291,7 +431,7 @@ export default function Home() {
             alignItems: "center"
           }}
         >
-          <div style={{ display: "flex", gap: "14px", alignItems: "center" }}>
+          <div style={{ display: "flex", gap: "14px", alignItems: "center", flexWrap: "wrap" }}>
             <div
               style={{
                 background: networkBadge.bg,
@@ -396,7 +536,7 @@ export default function Home() {
           <h2>Active LAN Systems</h2>
           <span>
             {busy
-              ? `Sweeping subnet... (${deviceList.length} active systems found)`
+              ? `Backend Agent sweeping subnet... (${deviceList.length} active systems found)`
               : `${deviceList.length} active systems found`} · click a row for advice
           </span>
         </div>

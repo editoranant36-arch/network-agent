@@ -597,15 +597,34 @@ func hostname() string {
 	return h
 }
 
+func healthHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("content-type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{
+		"status":  "ok",
+		"agent":   "go",
+		"version": "1.0.0",
+	})
+}
+
 func devicesHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("content-type", "application/json")
+	if r.Method == http.MethodDelete {
+		mu.Lock()
+		devices = []Device{}
+		mu.Unlock()
+		json.NewEncoder(w).Encode(map[string]any{"success": true, "message": "Memory cleared"})
+		return
+	}
+
 	mu.RLock()
 	defer mu.RUnlock()
-	w.Header().Set("content-type", "application/json")
 	d := devices
 	if d == nil {
 		d = []Device{}
 	}
-	json.NewEncoder(w).Encode(d)
+	json.NewEncoder(w).Encode(map[string]any{
+		"devices": d,
+	})
 }
 
 func scanHandler(w http.ResponseWriter, r *http.Request) {
@@ -660,6 +679,7 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 
 func main() {
 	mux := http.NewServeMux()
+	mux.HandleFunc("/health", healthHandler)
 	mux.HandleFunc("/api/network", networkHandler)
 	mux.HandleFunc("/api/devices", devicesHandler)
 	mux.HandleFunc("/api/scan", scanHandler)

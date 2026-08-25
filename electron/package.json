@@ -1,0 +1,12 @@
+{
+  "name": "lan-sentinel-electron",
+  "version": "1.0.0",
+  "description": "Desktop application for LAN Sentinel Network Scanner",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron ."
+  },
+  "devDependencies": {
+    "electron": "^31.0.0"
+  }
+}

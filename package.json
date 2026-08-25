@@ -9,6 +9,10 @@
     "dev": "npm --prefix dashboard run dev",
     "build": "npm --prefix dashboard install && npm --prefix dashboard run build",
     "start": "npm --prefix dashboard run start",
-    "postinstall": "npm --prefix dashboard install"
+    "postinstall": "npm --prefix dashboard install",
+    "agent:go": "cd agent-go && go run main.go",
+    "agent:node": "npm --prefix netlens-agent run dev",
+    "agent:rust": "cargo run --manifest-path scanner-rs/Cargo.toml --",
+    "electron": "electron electron/main.js"
   }
 }

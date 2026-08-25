@@ -1,0 +1,73 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>LAN Sentinel</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+    body { width: 380px; min-height: 480px; background: #0b121d; color: #e9eef7; padding: 14px; }
+    .header { display: flex; align-items: center; justify-content: space-between; border-bottom: 1px solid #1c2a3d; padding-bottom: 10px; margin-bottom: 12px; }
+    .title { display: flex; align-items: center; gap: 8px; font-weight: bold; font-size: 14px; letter-spacing: 0.5px; }
+    .dot { width: 8px; height: 8px; border-radius: 50%; background: #4ade80; box-shadow: 0 0 8px #4ade80; }
+    .status-badge { font-size: 10px; background: #122017; color: #4ade80; border: 1px solid #1e5430; padding: 2px 8px; border-radius: 12px; }
+    .network-card { background: #111a28; border: 1px solid #20354a; border-radius: 8px; padding: 10px 12px; margin-bottom: 12px; font-size: 12px; }
+    .network-ssid { font-size: 13px; font-weight: bold; color: #62e6a7; margin-bottom: 4px; }
+    .network-details { color: #8da0b8; font-size: 11px; }
+    .scan-bar { display: flex; gap: 8px; margin-bottom: 12px; }
+    .scan-bar input { flex: 1; background: #070c14; border: 1px solid #20354a; color: #fff; padding: 6px 10px; border-radius: 6px; font-size: 12px; }
+    .scan-bar button { background: #62e6a7; color: #05140e; border: none; font-weight: bold; padding: 6px 14px; border-radius: 6px; cursor: pointer; font-size: 12px; }
+    .scan-bar button:hover { background: #4ade80; }
+    .progress-wrap { margin-bottom: 12px; font-size: 11px; color: #62e6a7; }
+    .progress-bar { height: 4px; background: #15202e; border-radius: 2px; overflow: hidden; margin-top: 4px; }
+    .progress-fill { height: 100%; width: 0%; background: #4ade80; transition: width 0.2s; }
+    .device-list { max-height: 260px; overflow-y: auto; display: flex; flex-direction: column; gap: 6px; }
+    .device-card { background: #101926; border: 1px solid #1a2a3d; border-radius: 6px; padding: 8px 10px; font-size: 11px; }
+    .device-card:hover { border-color: #2b4566; }
+    .device-top { display: flex; justify-content: space-between; align-items: center; margin-bottom: 2px; }
+    .device-ip { font-weight: bold; color: #fff; }
+    .device-host { color: #62e6a7; font-weight: 500; }
+    .device-meta { color: #718097; font-size: 10px; }
+    .ports-badge { display: inline-block; background: #162332; color: #87c7ff; padding: 1px 4px; border-radius: 3px; font-size: 9px; margin-left: 4px; }
+    .footer { margin-top: 12px; padding-top: 8px; border-top: 1px solid #1c2a3d; text-align: center; }
+    .footer a { color: #62e6a7; text-decoration: none; font-size: 11px; font-weight: 500; }
+    .footer a:hover { text-decoration: underline; }
+    .empty-state { text-align: center; color: #69778b; font-size: 11px; padding: 20px 0; }
+  </style>
+</head>
+<body>
+  <div class="header">
+    <div class="title">
+      <span class="dot"></span> LAN Sentinel
+    </div>
+    <span class="status-badge" id="agentBadge">Agent Ready</span>
+  </div>
+
+  <div class="network-card" id="networkCard">
+    <div class="network-ssid" id="ssidLabel">Wi-Fi: Auto-Detecting...</div>
+    <div class="network-details" id="detailsLabel">Gateway: Detecting · Subnet: —</div>
+  </div>
+
+  <div class="scan-bar">
+    <input type="text" id="cidrInput" value="192.168.0.0/24" placeholder="CIDR Subnet" />
+    <button id="scanBtn">Scan</button>
+  </div>
+
+  <div class="progress-wrap" id="progressWrap" style="display: none;">
+    <div id="progressText">Scanning network...</div>
+    <div class="progress-bar">
+      <div class="progress-fill" id="progressFill"></div>
+    </div>
+  </div>
+
+  <div class="device-list" id="deviceList">
+    <div class="empty-state">Click "Scan" to discover active LAN devices.</div>
+  </div>
+
+  <div class="footer">
+    <a href="http://localhost:3000" target="_blank" id="openDashboard">Open Full Web Dashboard &rarr;</a>
+  </div>
+
+  <script src="popup.js"></script>
+</body>
+</html>

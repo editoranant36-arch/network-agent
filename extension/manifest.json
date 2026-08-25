@@ -1,0 +1,23 @@
+{
+  "manifest_version": 3,
+  "name": "LAN Sentinel - Wi-Fi Network Scanner",
+  "version": "1.0.0",
+  "description": "Intelligent active Wi-Fi and LAN scanner with device discovery, open port inspection, and defensive security advice.",
+  "permissions": [
+    "storage",
+    "activeTab"
+  ],
+  "host_permissions": [
+    "http://127.0.0.1:*/*",
+    "http://localhost:*/*",
+    "http://192.168.*.*/*",
+    "http://10.*.*.*/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "LAN Sentinel Network Scanner"
+  }
+}

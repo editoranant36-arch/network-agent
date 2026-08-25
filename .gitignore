@@ -1,15 +1,18 @@
 # Dependencies
 node_modules/
 dashboard/node_modules/
+netlens-agent/node_modules/
+electron/node_modules/
 .pnp
 .pnp.js
 
-# Next.js build
+# Next.js & Subproject builds
 .next/
 dashboard/.next/
 out/
 build/
 dist/
+netlens-agent/dist/
 
 # Rust build
 target/

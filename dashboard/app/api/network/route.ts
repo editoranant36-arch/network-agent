@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
-import { getLocalNetworkInfo } from "../../lib/scanner";
+import { getDetailedNetworkProfile } from "../../lib/scanner";
 
 export async function GET() {
-  const info = getLocalNetworkInfo();
-  return NextResponse.json(info);
+  const profile = await getDetailedNetworkProfile();
+  return NextResponse.json(profile);
 }

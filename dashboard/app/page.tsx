@@ -3,13 +3,15 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
   Device,
+  NetworkProfile,
   buildClientDefensiveAdvice,
-  detectClientLocalNetwork,
+  detectBrowserNetworkProfile,
   runClientNetworkScan
 } from "./lib/clientScanner";
 
 export default function Home() {
   const [cidr, setCidr] = useState("192.168.0.0/24");
+  const [profile, setProfile] = useState<NetworkProfile | null>(null);
   const [devices, setDevices] = useState<Device[]>([]);
   const [busy, setBusy] = useState(false);
   const [progress, setProgress] = useState(0);
@@ -18,8 +20,9 @@ export default function Home() {
   const [selected, setSelected] = useState<Device | null>(null);
   const [lastScanned, setLastScanned] = useState<string | null>(null);
   const abortControllerRef = useRef<AbortController | null>(null);
+  const autoScanTriggeredRef = useRef(false);
 
-  // Initialize network info and cached devices on page load
+  // Initialize network info and auto-detect Wi-Fi type (Personal vs Public)
   useEffect(() => {
     // 1. Restore previous session in-memory devices if present
     try {
@@ -33,18 +36,29 @@ export default function Home() {
       }
     } catch {}
 
-    // 2. Fetch local network info from API, fallback to WebRTC
+    // 2. Fetch network profile & Wi-Fi configuration from API, fallback to browser
     fetch("/api/network")
       .then((r) => r.json())
-      .then((info) => {
-        if (info && info.cidr) {
-          setCidr(info.cidr);
+      .then((netProfile: NetworkProfile) => {
+        if (netProfile) {
+          setProfile(netProfile);
+          if (netProfile.cidr) setCidr(netProfile.cidr);
+          // Auto-trigger scan if no devices yet
+          if (!autoScanTriggeredRef.current) {
+            autoScanTriggeredRef.current = true;
+            triggerAutoScan(netProfile.cidr);
+          }
         }
       })
       .catch(() => {
-        detectClientLocalNetwork()
-          .then((info) => {
-            if (info && info.cidr) setCidr(info.cidr);
+        detectBrowserNetworkProfile()
+          .then((bProfile) => {
+            setProfile(bProfile);
+            if (bProfile.cidr) setCidr(bProfile.cidr);
+            if (!autoScanTriggeredRef.current) {
+              autoScanTriggeredRef.current = true;
+              triggerAutoScan(bProfile.cidr);
+            }
           })
           .catch(() => {});
       });
@@ -63,11 +77,15 @@ export default function Home() {
       .catch(() => {});
   }, []);
 
+  function triggerAutoScan(targetCidr?: string) {
+    executeScan(targetCidr || cidr);
+  }
+
   // Complete Network Scan: Sweeps all IPs 1-254, checks ping replies, and displays all active systems
-  async function scan() {
+  async function executeScan(targetCidr: string) {
     if (busy) return;
 
-    // Immediately clear previous scan data for a clean fresh scan
+    // Clear previous scan data for a clean fresh scan
     setDevices([]);
     try {
       sessionStorage.removeItem("lan_devices");
@@ -76,7 +94,7 @@ export default function Home() {
     setBusy(true);
     setError("");
     setProgress(15);
-    setProgressText("Sweeping subnet IPs 1-254 and checking active ping replies...");
+    setProgressText(`Auto-analyzing ${profile?.ssid || "Wi-Fi"} network and sweeping IPs...`);
 
     const controller = new AbortController();
     abortControllerRef.current = controller;
@@ -86,7 +104,6 @@ export default function Home() {
     try {
       let results: Device[] = [];
 
-      // 1. ALWAYS call backend /api/scan first for full raw socket, NetBIOS, ARP, and OUI discovery
       setProgress(35);
       setProgressText("Scanning active hosts, NetBIOS names, MAC vendors, and open ports...");
 
@@ -94,7 +111,7 @@ export default function Home() {
         const res = await fetch("/api/scan", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ cidr, ports: scanPorts }),
+          body: JSON.stringify({ cidr: targetCidr, ports: scanPorts }),
           signal: controller.signal
         });
 
@@ -108,13 +125,13 @@ export default function Home() {
         if (err?.name === "AbortError") throw err;
       }
 
-      // 2. If backend API was unreachable (e.g. static host), run in-browser client scanner
+      // If backend API was unreachable (e.g. static CDN host), run in-browser client scanner
       if (results.length === 0) {
         setProgress(25);
         setProgressText("Probing local Wi-Fi subnet directly in browser...");
 
         results = await runClientNetworkScan(
-          cidr,
+          targetCidr,
           scanPorts,
           (scanned, total, pct) => {
             setProgress(pct);
@@ -152,6 +169,10 @@ export default function Home() {
       setProgress(100);
       abortControllerRef.current = null;
     }
+  }
+
+  function scan() {
+    executeScan(cidr);
   }
 
   function stopScan() {
@@ -196,12 +217,41 @@ export default function Home() {
 
   const deviceList = Array.isArray(devices) ? devices : [];
 
+  const networkBadge = useMemo(() => {
+    const type = profile?.networkType || "personal";
+    if (type === "personal") {
+      return {
+        label: "🏠 PERSONAL HOME WI-FI",
+        color: "#4ade80",
+        bg: "#0d2818",
+        border: "#1e5430",
+        desc: "Trusted Private Network"
+      };
+    }
+    if (type === "public") {
+      return {
+        label: "☕ PUBLIC / SHARED HOTSPOT",
+        color: "#fbbf24",
+        bg: "#2b2108",
+        border: "#5c4811",
+        desc: "Untrusted Network (High Risk)"
+      };
+    }
+    return {
+      label: "🏢 ENTERPRISE CORPORATE LAN",
+      color: "#60a5fa",
+      bg: "#0c2340",
+      border: "#1e4775",
+      desc: "Monitored Domain Network"
+    };
+  }, [profile]);
+
   return (
     <main>
       <header>
         <div>
           <span className="dot" /> <b>LAN SENTINEL</b>
-          <small> active LAN network scanner & monitor</small>
+          <small> intelligent Wi-Fi auto-detection & security monitor</small>
         </div>
         <div style={{ display: "flex", gap: "10px", alignItems: "center" }}>
           {lastScanned && <small style={{ color: "#8996a9" }}>Last scan: {lastScanned}</small>}
@@ -225,11 +275,69 @@ export default function Home() {
         </div>
       </header>
 
+      {/* Wi-Fi Intelligence Auto-Detection Card */}
+      {profile && (
+        <section
+          style={{
+            background: "#0f1722",
+            border: `1px solid ${networkBadge.border}`,
+            borderRadius: "10px",
+            padding: "16px 20px",
+            marginTop: "16px",
+            display: "flex",
+            flexWrap: "wrap",
+            gap: "16px",
+            justifyContent: "space-between",
+            alignItems: "center"
+          }}
+        >
+          <div style={{ display: "flex", gap: "14px", alignItems: "center" }}>
+            <div
+              style={{
+                background: networkBadge.bg,
+                color: networkBadge.color,
+                border: `1px solid ${networkBadge.border}`,
+                padding: "6px 14px",
+                borderRadius: "20px",
+                fontSize: "12px",
+                fontWeight: "bold",
+                letterSpacing: "0.5px"
+              }}
+            >
+              {networkBadge.label}
+            </div>
+            <div>
+              <div style={{ fontSize: "16px", fontWeight: "bold", color: "#fff" }}>
+                SSID: <span style={{ color: "#62e6a7" }}>{profile.ssid}</span>
+                {profile.signal && <span style={{ fontSize: "12px", color: "#8996a9", marginLeft: "8px" }}>📶 {profile.signal}</span>}
+              </div>
+              <div style={{ fontSize: "12px", color: "#8da0b8", marginTop: "2px" }}>
+                Security: <b style={{ color: "#dce7f5" }}>{profile.security}</b> · Gateway:{" "}
+                <b style={{ color: "#dce7f5" }}>{profile.gateway}</b> ({profile.gatewayVendor || "Router"})
+              </div>
+            </div>
+          </div>
+
+          <div style={{ display: "flex", gap: "20px", alignItems: "center" }}>
+            <div style={{ textAlign: "right" }}>
+              <div style={{ fontSize: "11px", color: "#8996a9", textTransform: "uppercase" }}>Network Trust Rating</div>
+              <div style={{ fontSize: "18px", fontWeight: "bold", color: networkBadge.color }}>
+                {profile.trustScore}/100 · <span style={{ fontSize: "12px", fontWeight: "normal" }}>{networkBadge.desc}</span>
+              </div>
+            </div>
+          </div>
+        </section>
+      )}
+
       <section className="hero">
         <h1>
           Network <span>Overview</span>
         </h1>
-        <p>Live LAN scanner. Sweeps all subnet IPs (1-254), verifies ping & socket replies, and displays all active systems in memory.</p>
+        <p>
+          {profile?.networkType === "public"
+            ? "⚠️ Public Wi-Fi Hotspot detected. Monitoring for lateral scans, rogue gateways, and unencrypted traffic."
+            : "Protected Wi-Fi network detected. Sweeps all subnet IPs (1-254), verifies ping & socket replies, and catalogs all active systems."}
+        </p>
         <div className="bar">
           <input
             value={cidr}
@@ -242,7 +350,7 @@ export default function Home() {
               Stop
             </button>
           ) : (
-            <button onClick={scan}>Start scan</button>
+            <button onClick={scan}>Re-Scan Network</button>
           )}
         </div>
 
@@ -361,14 +469,14 @@ export default function Home() {
               {!deviceList.length && !busy && (
                 <tr>
                   <td colSpan={7} className="empty">
-                    No active systems found yet. Click &quot;Start scan&quot; above to scan for active devices on your LAN.
+                    No active systems found yet. Click &quot;Scan Network&quot; above to scan for active devices on your LAN.
                   </td>
                 </tr>
               )}
               {busy && !deviceList.length && (
                 <tr>
                   <td colSpan={7} className="empty" style={{ color: "#62e6a7" }}>
-                    Probing subnet IPs 1-254 for active ping replies... online devices will appear here automatically.
+                    Auto-probing subnet IPs 1-254 for active ping replies... online devices will appear here automatically.
                   </td>
                 </tr>
               )}
@@ -434,7 +542,7 @@ export default function Home() {
               Recommendations are defensive. Verify the service owner and business need before changing firewall or service settings.
             </div>
 
-            {buildClientDefensiveAdvice(selected).map((a, i) => (
+            {buildClientDefensiveAdvice(selected, profile?.networkType).map((a, i) => (
               <article className="adviceItem" key={i}>
                 <div className={`severity ${a.severity}`}>{a.severity.toUpperCase()}</div>
                 <h3>{a.title}</h3>

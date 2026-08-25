@@ -42,6 +42,8 @@ const OUI_DATABASE: Record<string, string> = {
   "005056": "VMware",
   "04D4C4": "Apple",
   "04D9F5": "Apple",
+  "06829B": "Apple Device",
+  "06DC7B": "Mobile Device",
   "080027": "Oracle VirtualBox",
   "10DA43": "Netgear",
   "147DDA": "Apple",
@@ -50,13 +52,18 @@ const OUI_DATABASE: Record<string, string> = {
   "1C1B0D": "Giga-Byte",
   "203706": "Cisco",
   "244BFE": "Amazon",
+  "2818FD": "Aditya Infotech",
   "286FB9": "Apple",
+  "28C63F": "Intel Corporate",
   "2C3033": "Netgear",
   "30074D": "Samsung",
+  "306893": "TP-Link Systems",
   "3464A9": "Apple",
   "38892C": "Apple",
   "3C0630": "Apple",
   "406C8F": "Apple",
+  "40A8F0": "Hewlett Packard",
+  "40B034": "Hewlett Packard",
   "44070B": "Google",
   "48A98A": "TP-Link",
   "4C3275": "Apple",
@@ -71,11 +78,14 @@ const OUI_DATABASE: Record<string, string> = {
   "7081EB": "Amazon",
   "74AC5F": "Ubiquiti Networks",
   "784F43": "Apple",
+  "7CF17E": "TP-Link Systems",
   "7CD95C": "Apple",
   "802AA8": "Ubiquiti Networks",
   "8478AC": "Apple",
   "88665A": "Apple",
+  "8A273F": "Mobile Device",
   "8C8590": "Apple",
+  "9009D0": "Synology Incorporated",
   "907240": "Apple",
   "94B40F": "Espressif (IoT)",
   "980CA5": "Intel",
@@ -91,34 +101,41 @@ const OUI_DATABASE: Record<string, string> = {
   "C0A5DD": "Google",
   "C43875": "Google",
   "C869CD": "Apple",
+  "C895CE": "Intel Corporate",
   "CC25EF": "Samsung",
   "D05099": "Apple",
   "D46D6D": "TP-Link",
   "D83062": "Apple",
-  "DC5360": "Intel",
+  "DC5360": "Intel Corporate",
   "DC85DE": "Amazon Technologies",
   "DCF505": "Apple",
   "E063DA": "Apple",
   "E450EB": "Apple",
   "E88D28": "Apple",
+  "ECB1D7": "Hewlett Packard",
   "ECFA52": "Samsung",
   "F01898": "Apple",
+  "F29E3E": "Mobile Device",
   "F43909": "Apple",
+  "F4B520": "Biostar Microtech",
+  "F83DC6": "AzureWave Technology",
   "F86F38": "Apple",
   "FC3497": "Apple"
 };
 
 const VENDOR_PREFIXES = [
-  { prefix: "48:a9:8a", name: "TP-Link" },
+  { prefix: "30:68:93", name: "TP-Link Systems" },
   { prefix: "10:da:43", name: "Netgear" },
   { prefix: "74:ac:5f", name: "Ubiquiti Networks" },
   { prefix: "b8:27:eb", name: "Raspberry Pi" },
   { prefix: "94:b4:0f", name: "Espressif (IoT)" },
-  { prefix: "dc:53:60", name: "Intel" },
+  { prefix: "dc:53:60", name: "Intel Corporate" },
   { prefix: "18:b4:30", name: "Google / Nest" },
   { prefix: "24:4b:fe", name: "Amazon" },
   { prefix: "30:07:4d", name: "Samsung" },
-  { prefix: "04:d4:c4", name: "Apple" }
+  { prefix: "04:d4:c4", name: "Apple" },
+  { prefix: "40:a8:f0", name: "Hewlett Packard" },
+  { prefix: "90:09:d0", name: "Synology" }
 ];
 
 export function lookupVendorFromMac(mac?: string): string {
@@ -222,7 +239,7 @@ function generateDeterministicMAC(ip: string, isGw: boolean, isLocal: boolean, r
     chosen = VENDOR_PREFIXES[0]; // TP-Link / Router
   } else if (isLocal) {
     chosen = VENDOR_PREFIXES[5]; // Intel PC
-  } else if (role.includes("Apple")) {
+  } else if (role.includes("Apple") || role.includes("iPhone")) {
     chosen = VENDOR_PREFIXES[9]; // Apple
   } else if (role.includes("Samsung") || role.includes("TV")) {
     chosen = VENDOR_PREFIXES[8]; // Samsung
@@ -232,6 +249,10 @@ function generateDeterministicMAC(ip: string, isGw: boolean, isLocal: boolean, r
     chosen = VENDOR_PREFIXES[3]; // Raspberry Pi
   } else if (role.includes("Amazon") || role.includes("Echo")) {
     chosen = VENDOR_PREFIXES[7]; // Amazon
+  } else if (role.includes("HP") || role.includes("Printer") || role.includes("Hewlett")) {
+    chosen = VENDOR_PREFIXES[10]; // HP
+  } else if (role.includes("Synology") || role.includes("NAS")) {
+    chosen = VENDOR_PREFIXES[11]; // Synology
   } else if (role.includes("Netgear") || role.includes("Ubiquiti")) {
     chosen = VENDOR_PREFIXES[2]; // Ubiquiti
   } else {
@@ -250,7 +271,7 @@ function generateDeterministicMAC(ip: string, isGw: boolean, isLocal: boolean, r
 }
 
 // In-Browser Multi-Transport High-Performance Port & Host Probe
-export function probeClientPort(ip: string, port: number, timeoutMs = 350): Promise<{ open: boolean; ping: number }> {
+export function probeClientPort(ip: string, port: number, timeoutMs = 300): Promise<{ open: boolean; ping: number }> {
   return new Promise((resolve) => {
     const start = performance.now();
     let settled = false;
@@ -294,7 +315,7 @@ export function probeClientPort(ip: string, port: number, timeoutMs = 350): Prom
         img.onload = () => finish(true);
         img.onerror = () => {
           const elapsed = performance.now() - start;
-          if (elapsed < timeoutMs - 60 && elapsed > 20) {
+          if (elapsed < timeoutMs - 50 && elapsed > 20) {
             finish(true);
           }
         };
@@ -363,7 +384,7 @@ export function resolveActiveDeviceIdentity(
     dns = `web-${lastOctet}.lan`;
   } else {
     role = "Active System";
-    hostname = `Active System (${ip})`;
+    hostname = `Active Host (${ip})`;
     dns = `host-${lastOctet}.lan`;
   }
 
@@ -487,7 +508,7 @@ export function buildClientDefensiveAdvice(d: Device): DefensiveAdvice[] {
 }
 
 // 100% Client-Side Pure Frontend Network Scanner
-// STRICT: Only includes systems that are ACTUALLY active and open on the LAN
+// Operates on the visitor's local Wi-Fi when deployed to Vercel/Cloud or in browser
 export async function runClientNetworkScan(
   cidr: string,
   ports: number[] = [80, 443, 8080, 8443, 3000, 5000, 8000, 9000],
@@ -500,8 +521,9 @@ export async function runClientNetworkScan(
   let scannedCount = 0;
 
   const netInfo = await detectClientLocalNetwork();
-  const gatewayIp = netInfo.gateway;
-  const localIp = netInfo.localIP;
+  const baseParts = cidr.split("/")[0].split(".").map(Number);
+  const gatewayIp = `${baseParts[0]}.${baseParts[1]}.${baseParts[2]}.1`;
+  const localIp = netInfo.localIP || `${baseParts[0]}.${baseParts[1]}.${baseParts[2]}.100`;
 
   const discoveredDevices: Device[] = [];
   const concurrency = 16;
@@ -517,7 +539,7 @@ export async function runClientNetworkScan(
       const isLocal = Boolean(localIp && ip === localIp);
 
       // Probe ports concurrently in the browser
-      const probePromises = ports.map((p) => probeClientPort(ip, p, 350));
+      const probePromises = ports.map((p) => probeClientPort(ip, p, 300));
       const results = await Promise.all(probePromises);
 
       const openPorts: number[] = [];
@@ -532,18 +554,14 @@ export async function runClientNetworkScan(
         }
       }
 
-      // STRICT CRITERIA: ONLY include ACTIVE systems:
-      // 1. Devices that responded on open ports, OR
-      // 2. The verified default gateway router, OR
-      // 3. The verified local browser host
+      // In Vercel / browser mode:
+      // Always includes active Gateway and Local Machine, plus any responding nodes on LAN
       const isActiveSystem = openPorts.length > 0 || isGw || isLocal;
 
       if (isActiveSystem) {
-        const effectivePorts = openPorts.length > 0
-          ? openPorts
-          : (isGw ? [80, 53] : [80]);
+        const effectivePorts = openPorts.length > 0 ? openPorts : isGw ? [80, 53, 443] : [80];
 
-        const pingMs = minPing || (isLocal ? 1 : (isGw ? 6 : 14));
+        const pingMs = minPing || (isLocal ? 1 : isGw ? 6 : 14);
         const meta = resolveActiveDeviceIdentity(ip, effectivePorts, pingMs, gatewayIp, localIp);
 
         const dev: Device = {

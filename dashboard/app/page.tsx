@@ -17,21 +17,11 @@ export default function Home() {
   const [error, setError] = useState("");
   const [selected, setSelected] = useState<Device | null>(null);
   const [lastScanned, setLastScanned] = useState<string | null>(null);
-  const [isCloud, setIsCloud] = useState(false);
   const abortControllerRef = useRef<AbortController | null>(null);
 
   // Initialize network info and cached devices on page load
   useEffect(() => {
-    // 1. Check if running on Vercel / Cloud or Localhost
-    const cloudEnv =
-      typeof window !== "undefined" &&
-      window.location.hostname !== "localhost" &&
-      window.location.hostname !== "127.0.0.1" &&
-      !window.location.hostname.startsWith("192.168.") &&
-      !window.location.hostname.startsWith("10.");
-    setIsCloud(cloudEnv);
-
-    // 2. Restore previous session in-memory devices if present
+    // 1. Restore previous session in-memory devices if present
     try {
       const cached = sessionStorage.getItem("lan_devices");
       const cachedTime = sessionStorage.getItem("lan_last_scan");
@@ -43,29 +33,41 @@ export default function Home() {
       }
     } catch {}
 
-    // 3. In cloud/Vercel, detect visitor's local Wi-Fi via browser WebRTC
-    detectClientLocalNetwork()
+    // 2. Fetch local network info from API, fallback to WebRTC
+    fetch("/api/network")
+      .then((r) => r.json())
       .then((info) => {
-        if (info && info.cidr) setCidr(info.cidr);
+        if (info && info.cidr) {
+          setCidr(info.cidr);
+        }
+      })
+      .catch(() => {
+        detectClientLocalNetwork()
+          .then((info) => {
+            if (info && info.cidr) setCidr(info.cidr);
+          })
+          .catch(() => {});
+      });
+
+    // 3. Load any active devices in memory from backend
+    fetch("/api/devices")
+      .then((r) => r.json())
+      .then((res) => {
+        if (res && Array.isArray(res.devices) && res.devices.length > 0) {
+          setDevices((prev) => (prev.length > 0 ? prev : res.devices));
+          if (res.last_scan) {
+            setLastScanned(new Date(res.last_scan).toLocaleTimeString());
+          }
+        }
       })
       .catch(() => {});
-
-    // If local, query local network info
-    if (!cloudEnv) {
-      fetch("/api/network")
-        .then((r) => r.json())
-        .then((info) => {
-          if (info && info.cidr) setCidr(info.cidr);
-        })
-        .catch(() => {});
-    }
   }, []);
 
-  // Smart Adaptive Scan: Uses Direct in-browser Wi-Fi scan on Vercel, and deep socket scan on Local
+  // Complete Network Scan: Sweeps all IPs 1-254, checks ping replies, and displays all active systems
   async function scan() {
     if (busy) return;
 
-    // Immediately clear previous scan data
+    // Immediately clear previous scan data for a clean fresh scan
     setDevices([]);
     try {
       sessionStorage.removeItem("lan_devices");
@@ -74,7 +76,7 @@ export default function Home() {
     setBusy(true);
     setError("");
     setProgress(15);
-    setProgressText("Initializing network scan for active systems...");
+    setProgressText("Sweeping subnet IPs 1-254 and checking active ping replies...");
 
     const controller = new AbortController();
     abortControllerRef.current = controller;
@@ -82,50 +84,41 @@ export default function Home() {
     const scanPorts = [21, 22, 53, 80, 135, 139, 443, 445, 1883, 3000, 3389, 5000, 5353, 8000, 8080, 8443, 9000];
 
     try {
-      // Check if running on localhost / private network
-      const isLocalServer =
-        typeof window !== "undefined" &&
-        (window.location.hostname === "localhost" ||
-          window.location.hostname === "127.0.0.1" ||
-          window.location.hostname.startsWith("192.168.") ||
-          window.location.hostname.startsWith("10."));
-
       let results: Device[] = [];
 
-      if (isLocalServer) {
-        setProgress(35);
-        setProgressText("Running local socket sweep & NetBIOS name resolution...");
+      // 1. ALWAYS call backend /api/scan first for full raw socket, NetBIOS, ARP, and OUI discovery
+      setProgress(35);
+      setProgressText("Scanning active hosts, NetBIOS names, MAC vendors, and open ports...");
 
-        try {
-          const res = await fetch("/api/scan", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ cidr, ports: scanPorts }),
-            signal: controller.signal
-          });
+      try {
+        const res = await fetch("/api/scan", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ cidr, ports: scanPorts }),
+          signal: controller.signal
+        });
 
-          if (res.ok) {
-            const data: Device[] = await res.json();
-            if (Array.isArray(data) && data.length > 0) {
-              results = data;
-            }
+        if (res.ok) {
+          const data: Device[] = await res.json();
+          if (Array.isArray(data) && data.length > 0) {
+            results = data;
           }
-        } catch (e: any) {
-          if (e?.name === "AbortError") throw e;
         }
+      } catch (err: any) {
+        if (err?.name === "AbortError") throw err;
       }
 
-      // If on Vercel cloud or if server API returned no devices, execute in-browser LAN scanner
+      // 2. If backend API was unreachable (e.g. static host), run in-browser client scanner
       if (results.length === 0) {
         setProgress(25);
-        setProgressText("Scanning your local Wi-Fi subnet directly in your browser...");
+        setProgressText("Probing local Wi-Fi subnet directly in browser...");
 
         results = await runClientNetworkScan(
           cidr,
           scanPorts,
           (scanned, total, pct) => {
             setProgress(pct);
-            setProgressText(`Scanning local Wi-Fi: ${pct}% (${scanned}/${total} IPs)`);
+            setProgressText(`Scanning subnet IPs: ${pct}% (${scanned}/${total} IPs)`);
           },
           (dev) => {
             setDevices((prev) => {
@@ -145,6 +138,7 @@ export default function Home() {
       setDevices(results);
       const timeStr = new Date().toLocaleTimeString();
       setLastScanned(timeStr);
+
       try {
         sessionStorage.setItem("lan_devices", JSON.stringify(results));
         sessionStorage.setItem("lan_last_scan", timeStr);
@@ -207,9 +201,7 @@ export default function Home() {
       <header>
         <div>
           <span className="dot" /> <b>LAN SENTINEL</b>
-          <small>
-            {isCloud ? " 🌐 cloud in-browser Wi-Fi scanner" : " 💻 local network monitor"}
-          </small>
+          <small> active LAN network scanner & monitor</small>
         </div>
         <div style={{ display: "flex", gap: "10px", alignItems: "center" }}>
           {lastScanned && <small style={{ color: "#8996a9" }}>Last scan: {lastScanned}</small>}
@@ -237,11 +229,7 @@ export default function Home() {
         <h1>
           Network <span>Overview</span>
         </h1>
-        <p>
-          {isCloud
-            ? "Cloud-ready scanner. Discovers your local Wi-Fi router, PC, hostnames, DNS, MAC vendors, and open ports directly in your browser."
-            : "Direct LAN scanner. Discovers active hosts, NetBIOS host names, DNS, MAC vendors, and open ports in temporary memory."}
-        </p>
+        <p>Live LAN scanner. Sweeps all subnet IPs (1-254), verifies ping & socket replies, and displays all active systems in memory.</p>
         <div className="bar">
           <input
             value={cidr}
@@ -300,8 +288,8 @@ export default function Home() {
           <h2>Active LAN Systems</h2>
           <span>
             {busy
-              ? `Scanning network... (${deviceList.length} active systems found)`
-              : `${deviceList.length} active systems discovered`} · click a row for advice
+              ? `Sweeping subnet... (${deviceList.length} active systems found)`
+              : `${deviceList.length} active systems found`} · click a row for advice
           </span>
         </div>
         <div className="tableWrap">
@@ -380,7 +368,7 @@ export default function Home() {
               {busy && !deviceList.length && (
                 <tr>
                   <td colSpan={7} className="empty" style={{ color: "#62e6a7" }}>
-                    Probing subnet hosts for active systems... online devices will appear here automatically.
+                    Probing subnet IPs 1-254 for active ping replies... online devices will appear here automatically.
                   </td>
                 </tr>
               )}

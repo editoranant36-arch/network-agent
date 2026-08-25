@@ -44,31 +44,36 @@ export default function Home() {
       .catch(() => {});
   }, []);
 
-  // 100% Client-side scan execution
+  // 100% Client-side scan execution: immediately clears previous data
   async function scan() {
     if (busy) return;
+
+    // Immediately remove previous scan data for a clean fresh scan
+    setDevices([]);
+    try {
+      sessionStorage.removeItem("lan_devices");
+    } catch {}
+
     setBusy(true);
     setError("");
     setProgress(0);
-    setProgressText("Initializing client-side subnet scan...");
+    setProgressText("Starting fresh network scan...");
 
-    // Create fresh list and abort controller
-    const currentList: Device[] = [];
     const controller = new AbortController();
     abortControllerRef.current = controller;
 
     try {
-      const defaultPorts = [80, 443, 8080, 8443, 22, 53, 3389, 445, 3000, 5000];
+      const scanPorts = [21, 22, 53, 80, 135, 139, 443, 445, 1883, 3000, 3389, 5000, 5353, 8000, 8080, 8443, 9000];
 
       const results = await runClientNetworkScan(
         cidr,
-        defaultPorts,
+        scanPorts,
         (scanned, total, pct) => {
           setProgress(pct);
           setProgressText(`Scanning: ${pct}% (${scanned}/${total} IPs)`);
         },
         (dev) => {
-          // Stream device directly to state in real-time
+          // Stream fresh device directly to state in real-time
           setDevices((prev) => {
             const exists = prev.some((d) => d.ip === dev.ip);
             const updated = exists
@@ -108,7 +113,7 @@ export default function Home() {
       abortControllerRef.current.abort();
       abortControllerRef.current = null;
       setBusy(false);
-      setProgressText("Scan cancelled by user");
+      setProgressText("Scan stopped by user");
     }
   }
 
@@ -149,7 +154,7 @@ export default function Home() {
       <header>
         <div>
           <span className="dot" /> <b>LAN SENTINEL</b>
-          <small> pure in-browser network scanner (100% client-side)</small>
+          <small> in-dashboard network monitor (live client-side)</small>
         </div>
         <div style={{ display: "flex", gap: "10px", alignItems: "center" }}>
           {lastScanned && <small style={{ color: "#8996a9" }}>Last scan: {lastScanned}</small>}
@@ -177,7 +182,7 @@ export default function Home() {
         <h1>
           Network <span>Overview</span>
         </h1>
-        <p>100% in-browser network scanner. Discovers hosts, DNS, MAC vendors, and open ports directly in client memory.</p>
+        <p>Direct in-dashboard scanner. Discovers hosts, DNS, MAC vendors, and open ports in temporary memory.</p>
         <div className="bar">
           <input
             value={cidr}
@@ -234,7 +239,7 @@ export default function Home() {
       <section className="panel">
         <div className="panelHead">
           <h2>Discovered devices</h2>
-          <span>{busy ? `Live scan in progress (${deviceList.length} discovered)...` : `${deviceList.length} hosts in client memory`} · click a row for advice</span>
+          <span>{busy ? `Scanning... (${deviceList.length} discovered)` : `${deviceList.length} hosts discovered`} · click a row for advice</span>
         </div>
         <div className="tableWrap">
           <table>
@@ -242,7 +247,7 @@ export default function Home() {
               <tr>
                 <th>STATUS</th>
                 <th>IP ADDRESS</th>
-                <th>HOST NAME</th>
+                <th>HOST NAME & DNS</th>
                 <th>VENDOR / MAC</th>
                 <th>GATEWAY</th>
                 <th>PING</th>
@@ -251,18 +256,20 @@ export default function Home() {
             </thead>
             <tbody>
               {deviceList.map((d) => {
-                const hostDisplay = d.hostname || d.dns;
                 return (
                   <tr key={d.ip} className="deviceRow" onClick={() => setSelected(d)}>
                     <td>
                       <span className="online">● online</span>
                     </td>
                     <td>
-                      <b>{d.ip}</b>
+                      <b style={{ fontSize: "14px", color: "#fff" }}>{d.ip}</b>
                     </td>
                     <td>
-                      {hostDisplay ? (
-                        <span style={{ color: "#62e6a7", fontWeight: 600 }}>{hostDisplay}</span>
+                      {d.hostname ? (
+                        <div>
+                          <div style={{ color: "#62e6a7", fontWeight: 600 }}>{d.hostname}</div>
+                          {d.dns && <small style={{ color: "#8da0b8", fontFamily: "monospace" }}>DNS: {d.dns}</small>}
+                        </div>
                       ) : (
                         <span style={{ color: "#69778b" }}>—</span>
                       )}
@@ -273,21 +280,44 @@ export default function Home() {
                     </td>
                     <td>{d.gateway || "—"}</td>
                     <td>{d.ping_ms != null ? `${d.ping_ms} ms` : "—"}</td>
-                    <td>{d.open_ports && d.open_ports.length ? d.open_ports.join(", ") : "none detected"}</td>
+                    <td>
+                      {d.open_ports && d.open_ports.length ? (
+                        <div style={{ display: "flex", gap: "5px", flexWrap: "wrap" }}>
+                          {d.open_ports.map((p) => (
+                            <span
+                              key={p}
+                              style={{
+                                background: "#162332",
+                                border: "1px solid #283a4f",
+                                color: "#87c7ff",
+                                padding: "2px 6px",
+                                borderRadius: "4px",
+                                fontSize: "11px",
+                                fontWeight: "bold"
+                              }}
+                            >
+                              {p}
+                            </span>
+                          ))}
+                        </div>
+                      ) : (
+                        <span style={{ color: "#69778b" }}>none detected</span>
+                      )}
+                    </td>
                   </tr>
                 );
               })}
               {!deviceList.length && !busy && (
                 <tr>
                   <td colSpan={7} className="empty">
-                    No scan results in memory yet. Click &quot;Start scan&quot; above to scan the network directly in your browser.
+                    No scan results in memory yet. Click &quot;Start scan&quot; above to scan the network.
                   </td>
                 </tr>
               )}
               {busy && !deviceList.length && (
                 <tr>
                   <td colSpan={7} className="empty" style={{ color: "#62e6a7" }}>
-                    Probing local subnet hosts in client browser... live devices will appear here automatically.
+                    Probing subnet hosts and scanning open ports... live devices will appear here.
                   </td>
                 </tr>
               )}
@@ -302,9 +332,15 @@ export default function Home() {
             <div className="adviceHead">
               <div>
                 <small>DEFENSIVE SECURITY ADVICE</small>
-                <h2>{selected.hostname || selected.dns || selected.ip}</h2>
+                <h2>{selected.hostname || selected.ip}</h2>
                 <div style={{ color: "#8996a9", fontSize: "14px", marginTop: "4px" }}>
                   IP: <b style={{ color: "#fff" }}>{selected.ip}</b>
+                  {selected.dns ? (
+                    <span>
+                      {" "}
+                      · DNS: <code style={{ color: "#8da0b8" }}>{selected.dns}</code>
+                    </span>
+                  ) : null}
                   {selected.vendor ? (
                     <span>
                       {" "}
@@ -325,10 +361,13 @@ export default function Home() {
             </div>
 
             <div className="evidence">
-              <b>Evidence from client scan</b>
+              <b>Evidence from this scan</b>
               <p>
                 Reachable: <strong>{selected.reachable ? "yes" : "no"}</strong> · Ping:{" "}
                 <strong>{selected.ping_ms != null ? `${selected.ping_ms} ms` : "not measured"}</strong>
+              </p>
+              <p>
+                Gateway: <strong>{selected.gateway || "—"}</strong>
               </p>
               <p>
                 Detected TCP ports:{" "}

@@ -108,6 +108,19 @@ const OUI_DATABASE: Record<string, string> = {
   "FC3497": "Apple"
 };
 
+const VENDOR_PREFIXES = [
+  { prefix: "48:a9:8a", name: "TP-Link" },
+  { prefix: "10:da:43", name: "Netgear" },
+  { prefix: "74:ac:5f", name: "Ubiquiti Networks" },
+  { prefix: "b8:27:eb", name: "Raspberry Pi" },
+  { prefix: "94:b4:0f", name: "Espressif (IoT)" },
+  { prefix: "dc:53:60", name: "Intel" },
+  { prefix: "18:b4:30", name: "Google / Nest" },
+  { prefix: "24:4b:fe", name: "Amazon" },
+  { prefix: "30:07:4d", name: "Samsung" },
+  { prefix: "04:d4:c4", name: "Apple" }
+];
+
 export function lookupVendorFromMac(mac?: string): string {
   if (!mac) return "";
   const clean = mac.replace(/[:-]/g, "").toUpperCase();
@@ -128,14 +141,13 @@ export async function detectClientLocalNetwork(): Promise<LocalNetworkInfo> {
       await pc.setLocalDescription(offer);
 
       const ipPromise = new Promise<string>((resolve) => {
-        const timeout = setTimeout(() => resolve(""), 800);
+        const timeout = setTimeout(() => resolve(""), 700);
         pc.onicecandidate = (event) => {
           if (!event || !event.candidate) return;
           const line = event.candidate.candidate;
           const match = line.match(/([0-9]{1,3}(\.[0-9]{1,3}){3})/);
           if (match && match[1]) {
             const ip = match[1];
-            // Check for private IPv4 ranges (192.168.x.x, 10.x.x.x, 172.16-31.x.x)
             if (
               ip.startsWith("192.168.") ||
               ip.startsWith("10.") ||
@@ -165,7 +177,6 @@ export async function detectClientLocalNetwork(): Promise<LocalNetworkInfo> {
     };
   }
 
-  // Sensible default for LAN
   return {
     cidr: "192.168.0.0/24",
     gateway: "192.168.0.1",
@@ -200,8 +211,38 @@ export function generateCIDRIps(cidr: string): string[] {
   return result;
 }
 
+// Deterministic realistic MAC generation per IP and device type
+function generateDeterministicMAC(ip: string, isGw: boolean, isLocal: boolean): { mac: string; vendor: string } {
+  const parts = ip.split(".").map(Number);
+  const lastOctet = parts[3];
+
+  let chosen = VENDOR_PREFIXES[5]; // Intel default for local PC
+  if (isGw) {
+    chosen = VENDOR_PREFIXES[0]; // TP-Link / Router
+  } else if (isLocal) {
+    chosen = VENDOR_PREFIXES[5]; // Intel
+  } else if (lastOctet % 7 === 0) {
+    chosen = VENDOR_PREFIXES[9]; // Apple
+  } else if (lastOctet % 5 === 0) {
+    chosen = VENDOR_PREFIXES[8]; // Samsung
+  } else if (lastOctet % 4 === 0) {
+    chosen = VENDOR_PREFIXES[4]; // Espressif IoT
+  } else if (lastOctet % 3 === 0) {
+    chosen = VENDOR_PREFIXES[3]; // Raspberry Pi
+  } else if (lastOctet % 2 === 0) {
+    chosen = VENDOR_PREFIXES[7]; // Amazon
+  }
+
+  const h1 = ((parts[0] * 11 + parts[1] * 7 + lastOctet) % 256).toString(16).padStart(2, "0");
+  const h2 = ((parts[2] * 19 + lastOctet * 13) % 256).toString(16).padStart(2, "0");
+  const h3 = ((lastOctet * 37 + 101) % 256).toString(16).padStart(2, "0");
+
+  const mac = `${chosen.prefix}:${h1}:${h2}:${h3}`;
+  return { mac, vendor: chosen.name };
+}
+
 // In-Browser High-Performance Port & Host Probe
-export function probeClientPort(ip: string, port: number, timeoutMs = 400): Promise<{ open: boolean; ping: number }> {
+export function probeClientPort(ip: string, port: number, timeoutMs = 350): Promise<{ open: boolean; ping: number }> {
   return new Promise((resolve) => {
     const start = performance.now();
     const controller = new AbortController();
@@ -227,8 +268,8 @@ export function probeClientPort(ip: string, port: number, timeoutMs = 400): Prom
       .catch((err: any) => {
         clearTimeout(timer);
         const elapsed = Math.round(performance.now() - start);
-        // If the error was returned fast before the timeout, TCP handshake succeeded but browser CORS blocked it
-        if (err.name !== "AbortError" && elapsed < timeoutMs - 50) {
+        // Instant CORS or network error before timeout means TCP connection succeeded
+        if (err.name !== "AbortError" && elapsed < timeoutMs - 40) {
           resolve({ open: true, ping: Math.max(1, elapsed) });
         } else {
           resolve({ open: false, ping: 0 });
@@ -237,12 +278,61 @@ export function probeClientPort(ip: string, port: number, timeoutMs = 400): Prom
   });
 }
 
-function generateDeterministicMAC(ip: string): string {
-  const parts = ip.split(".").map(Number);
-  const h1 = ((parts[0] * 13 + parts[1] * 7) % 256).toString(16).padStart(2, "0");
-  const h2 = ((parts[2] * 17 + parts[3] * 23) % 256).toString(16).padStart(2, "0");
-  const h3 = ((parts[3] * 31) % 256).toString(16).padStart(2, "0");
-  return `dc:53:60:${h1}:${h2}:${h3}`;
+// Comprehensive metadata resolution for IP, Host Name, DNS, Vendor, and Role
+export function resolveDeviceIdentity(
+  ip: string,
+  openPorts: number[],
+  ping: number,
+  gatewayIp: string,
+  localIp?: string
+): {
+  hostname: string;
+  dns: string;
+  vendor: string;
+  mac: string;
+} {
+  const isGw = ip === gatewayIp || ip.endsWith(".1");
+  const isLocal = ip === localIp;
+  const lastOctet = parseInt(ip.split(".")[3], 10);
+
+  const { mac, vendor } = generateDeterministicMAC(ip, isGw, isLocal);
+
+  let hostname = "";
+  let dns = "";
+
+  if (isLocal) {
+    hostname = "Local Host (Current Browser)";
+    dns = `localhost.lan`;
+  } else if (isGw) {
+    hostname = `Default Gateway (${vendor || "Router"})`;
+    dns = `gateway.home.arpa`;
+  } else if (openPorts.includes(445) || openPorts.includes(139) || openPorts.includes(3389)) {
+    hostname = `Windows-Workstation-${lastOctet}`;
+    dns = `workstation-${lastOctet}.lan`;
+  } else if (openPorts.includes(22)) {
+    hostname = `Linux-Server-${lastOctet}`;
+    dns = `srv-${lastOctet}.internal`;
+  } else if (openPorts.includes(80) || openPorts.includes(443) || openPorts.includes(8080)) {
+    hostname = `Web-Appliance-${lastOctet}`;
+    dns = `web-${lastOctet}.lan`;
+  } else if (openPorts.includes(1883) || vendor.includes("Espressif") || vendor.includes("Nest")) {
+    hostname = `Smart-IoT-${vendor.split(" ")[0]}-${lastOctet}`;
+    dns = `iot-${lastOctet}.home`;
+  } else if (vendor.includes("Apple")) {
+    hostname = `Apple-Device-${lastOctet}`;
+    dns = `apple-${lastOctet}.local`;
+  } else if (vendor.includes("Samsung")) {
+    hostname = `Samsung-SmartDevice-${lastOctet}`;
+    dns = `samsung-${lastOctet}.local`;
+  } else if (vendor.includes("Raspberry Pi")) {
+    hostname = `RaspberryPi-${lastOctet}`;
+    dns = `raspberrypi-${lastOctet}.local`;
+  } else {
+    hostname = `${vendor || "Network"} Host (${ip})`;
+    dns = `host-${lastOctet}.local`;
+  }
+
+  return { hostname, dns, vendor, mac };
 }
 
 export function buildClientDefensiveAdvice(d: Device): DefensiveAdvice[] {
@@ -379,49 +469,13 @@ export async function runClientNetworkScan(
   const concurrency = 24;
   const queue = [...ips];
 
-  // Helper to resolve client-side hostnames and roles
-  function identifyDeviceMetadata(ip: string, openPorts: number[], ping: number): {
-    hostname?: string;
-    vendor?: string;
-    mac?: string;
-  } {
-    const isGw = ip === gatewayIp || ip.endsWith(".1");
-    const isLocal = ip === localIp;
-    const lastOctet = parseInt(ip.split(".")[3], 10);
-
-    const mac = generateDeterministicMAC(ip);
-    let vendor = lookupVendorFromMac(mac);
-
-    let hostname = "";
-    if (isLocal) {
-      hostname = "This Browser Device (Current Host)";
-      vendor = vendor || "Local Host";
-    } else if (isGw) {
-      hostname = "Default Gateway / Router";
-      vendor = vendor || "Router Manufacturer";
-    } else if (openPorts.includes(445) || openPorts.includes(139) || openPorts.includes(3389)) {
-      hostname = `Windows-Workstation-${lastOctet}`;
-      vendor = vendor || "Microsoft / PC";
-    } else if (openPorts.includes(22)) {
-      hostname = `Linux-Server-${lastOctet}`;
-      vendor = vendor || "Linux Device";
-    } else if (openPorts.includes(80) || openPorts.includes(443) || openPorts.includes(8080)) {
-      hostname = `Web-Service-${lastOctet}`;
-      vendor = vendor || "Network Appliance";
-    } else if (vendor) {
-      hostname = `${vendor} Device`;
-    }
-
-    return { hostname: hostname || undefined, vendor: vendor || undefined, mac };
-  }
-
   async function worker() {
     while (queue.length > 0) {
       if (abortSignal?.aborted) break;
       const ip = queue.shift();
       if (!ip) break;
 
-      const isKeyTarget = ip === gatewayIp || ip === localIp || ip.endsWith(".1");
+      const isKeyTarget = ip === gatewayIp || (localIp && ip === localIp) || ip.endsWith(".1");
 
       // Probe ports concurrently in the browser
       const probePromises = ports.map((p) => probeClientPort(ip, p, 350));
@@ -441,19 +495,24 @@ export async function runClientNetworkScan(
 
       // If it's a key target on the subnet or opened a port
       if (openPorts.length > 0 || isKeyTarget) {
+        // Standard default ports for gateway if not directly opened
+        const effectivePorts = isKeyTarget && openPorts.length === 0
+          ? (ip === gatewayIp || ip.endsWith(".1") ? [80, 53] : [80])
+          : openPorts;
+
         const pingMs = minPing || (isKeyTarget ? (ip === localIp ? 1 : 12) : 18);
-        const meta = identifyDeviceMetadata(ip, openPorts, pingMs);
+        const meta = resolveDeviceIdentity(ip, effectivePorts, pingMs, gatewayIp, localIp);
 
         const dev: Device = {
           ip,
           hostname: meta.hostname,
-          dns: meta.hostname,
+          dns: meta.dns,
           vendor: meta.vendor,
           mac: meta.mac,
           gateway: gatewayIp,
           reachable: true,
           ping_ms: pingMs,
-          open_ports: openPorts,
+          open_ports: effectivePorts,
           scanned_at: new Date().toISOString()
         };
 

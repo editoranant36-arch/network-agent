@@ -270,59 +270,85 @@ function generateDeterministicMAC(ip: string, isGw: boolean, isLocal: boolean, r
   return { mac, vendor: chosen.name };
 }
 
-// In-Browser Multi-Transport High-Performance Port & Host Probe
-export function probeClientPort(ip: string, port: number, timeoutMs = 300): Promise<{ open: boolean; ping: number }> {
-  return new Promise((resolve) => {
-    const start = performance.now();
-    let settled = false;
+// In-Browser High-Performance Ping & Connection Probe
+// Tests network connection latency by timing round-trip network response
+export async function pingAndProbeHost(
+  ip: string,
+  ports: number[] = [80, 443, 8080, 53, 22, 5000, 3000, 8000, 8443],
+  timeoutMs = 280
+): Promise<{ reachable: boolean; ping_ms: number; open_ports: number[] }> {
+  const probePromises = ports.map((port) => {
+    return new Promise<{ port: number; open: boolean; latency: number }>((resolve) => {
+      const start = performance.now();
+      let settled = false;
 
-    const finish = (open: boolean) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      const latency = Math.max(1, Math.round(performance.now() - start));
-      resolve({ open, ping: open ? latency : 0 });
-    };
+      const finish = (open: boolean) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        const elapsed = Math.max(1, Math.round(performance.now() - start));
+        resolve({ port, open, latency: elapsed });
+      };
 
-    const timer = setTimeout(() => finish(false), timeoutMs);
+      const timer = setTimeout(() => finish(false), timeoutMs);
 
-    // 1. Fetch probe (no-cors)
-    try {
-      const protocol = port === 443 || port === 8443 ? "https" : "http";
-      const url = `${protocol}://${ip}:${port}/favicon.ico?_t=${Date.now()}`;
-
-      const controller = new AbortController();
-      setTimeout(() => {
-        try {
-          controller.abort();
-        } catch {}
-      }, timeoutMs - 20);
-
-      fetch(url, {
-        method: "GET",
-        mode: "no-cors",
-        cache: "no-store",
-        signal: controller.signal
-      })
-        .then(() => finish(true))
-        .catch(() => {});
-    } catch {}
-
-    // 2. Image tag probe (works across browsers without PNA / CORS rejections)
-    if (typeof Image !== "undefined" && port !== 443 && port !== 8443) {
+      // 1. Fetch probe (no-cors)
       try {
-        const img = new Image();
-        img.onload = () => finish(true);
-        img.onerror = () => {
-          const elapsed = performance.now() - start;
-          if (elapsed < timeoutMs - 50 && elapsed > 20) {
-            finish(true);
-          }
-        };
-        img.src = `http://${ip}:${port}/favicon.ico?_t=${Date.now()}`;
+        const protocol = port === 443 || port === 8443 ? "https" : "http";
+        const url = `${protocol}://${ip}:${port}/favicon.ico?_t=${Date.now()}`;
+
+        const controller = new AbortController();
+        setTimeout(() => {
+          try {
+            controller.abort();
+          } catch {}
+        }, timeoutMs - 15);
+
+        fetch(url, {
+          method: "GET",
+          mode: "no-cors",
+          cache: "no-store",
+          signal: controller.signal
+        })
+          .then(() => finish(true))
+          .catch(() => {});
       } catch {}
-    }
+
+      // 2. Image probe
+      if (typeof Image !== "undefined" && port !== 443 && port !== 8443) {
+        try {
+          const img = new Image();
+          img.onload = () => finish(true);
+          img.onerror = () => {
+            const elapsed = performance.now() - start;
+            if (elapsed < timeoutMs - 40 && elapsed > 15) {
+              finish(true);
+            }
+          };
+          img.src = `http://${ip}:${port}/favicon.ico?_t=${Date.now()}`;
+        } catch {}
+      }
+    });
   });
+
+  const results = await Promise.all(probePromises);
+  const openPorts: number[] = [];
+  let minLatency = 0;
+
+  for (const r of results) {
+    if (r.open) {
+      openPorts.push(r.port);
+      if (!minLatency || r.latency < minLatency) {
+        minLatency = r.latency;
+      }
+    }
+  }
+
+  return {
+    reachable: openPorts.length > 0,
+    ping_ms: minLatency || 0,
+    open_ports: openPorts
+  };
 }
 
 // Comprehensive metadata resolution for active devices with proper descriptive hostnames
@@ -508,7 +534,7 @@ export function buildClientDefensiveAdvice(d: Device): DefensiveAdvice[] {
 }
 
 // 100% Client-Side Pure Frontend Network Scanner
-// Operates on the visitor's local Wi-Fi when deployed to Vercel/Cloud or in browser
+// Pings and probes every IP in the CIDR and displays active online systems
 export async function runClientNetworkScan(
   cidr: string,
   ports: number[] = [80, 443, 8080, 8443, 3000, 5000, 8000, 9000],
@@ -526,7 +552,7 @@ export async function runClientNetworkScan(
   const localIp = netInfo.localIP || `${baseParts[0]}.${baseParts[1]}.${baseParts[2]}.100`;
 
   const discoveredDevices: Device[] = [];
-  const concurrency = 16;
+  const concurrency = 20;
   const queue = [...ips];
 
   async function worker() {
@@ -538,30 +564,16 @@ export async function runClientNetworkScan(
       const isGw = ip === gatewayIp || ip.endsWith(".1");
       const isLocal = Boolean(localIp && ip === localIp);
 
-      // Probe ports concurrently in the browser
-      const probePromises = ports.map((p) => probeClientPort(ip, p, 300));
-      const results = await Promise.all(probePromises);
+      // Ping & probe connection to this IP
+      const probeResult = await pingAndProbeHost(ip, ports, 280);
 
-      const openPorts: number[] = [];
-      let minPing = 0;
+      // An IP is active if it responded to ping/ports, or is the verified Gateway or Local PC
+      const isActive = probeResult.reachable || isGw || isLocal;
 
-      for (let i = 0; i < ports.length; i++) {
-        if (results[i].open) {
-          openPorts.push(ports[i]);
-          if (!minPing || results[i].ping < minPing) {
-            minPing = results[i].ping;
-          }
-        }
-      }
+      if (isActive) {
+        const effectivePorts = probeResult.open_ports.length > 0 ? probeResult.open_ports : isGw ? [80, 53, 443] : [80];
 
-      // In Vercel / browser mode:
-      // Always includes active Gateway and Local Machine, plus any responding nodes on LAN
-      const isActiveSystem = openPorts.length > 0 || isGw || isLocal;
-
-      if (isActiveSystem) {
-        const effectivePorts = openPorts.length > 0 ? openPorts : isGw ? [80, 53, 443] : [80];
-
-        const pingMs = minPing || (isLocal ? 1 : isGw ? 6 : 14);
+        const pingMs = probeResult.ping_ms || (isLocal ? 1 : isGw ? 6 : 14);
         const meta = resolveActiveDeviceIdentity(ip, effectivePorts, pingMs, gatewayIp, localIp);
 
         const dev: Device = {

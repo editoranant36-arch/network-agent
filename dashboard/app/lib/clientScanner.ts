@@ -249,35 +249,58 @@ function generateDeterministicMAC(ip: string, isGw: boolean, isLocal: boolean, r
   return { mac, vendor: chosen.name };
 }
 
-// In-Browser High-Performance Port & Host Probe
-export function probeClientPort(ip: string, port: number, timeoutMs = 450): Promise<{ open: boolean; ping: number }> {
+// In-Browser Multi-Transport High-Performance Port & Host Probe
+export function probeClientPort(ip: string, port: number, timeoutMs = 350): Promise<{ open: boolean; ping: number }> {
   return new Promise((resolve) => {
     const start = performance.now();
-    const controller = new AbortController();
-    const timer = setTimeout(() => {
-      controller.abort();
-      resolve({ open: false, ping: 0 });
-    }, timeoutMs);
+    let settled = false;
 
-    const protocol = port === 443 || port === 8443 ? "https" : "http";
-    const url = `${protocol}://${ip}:${port}/favicon.ico?_t=${Date.now()}`;
+    const finish = (open: boolean) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      const latency = Math.max(1, Math.round(performance.now() - start));
+      resolve({ open, ping: open ? latency : 0 });
+    };
 
-    fetch(url, {
-      method: "GET",
-      mode: "no-cors",
-      cache: "no-store",
-      signal: controller.signal
-    })
-      .then(() => {
-        clearTimeout(timer);
-        const latency = Math.max(1, Math.round(performance.now() - start));
-        // Active HTTP response received
-        resolve({ open: true, ping: latency });
+    const timer = setTimeout(() => finish(false), timeoutMs);
+
+    // 1. Fetch probe (no-cors)
+    try {
+      const protocol = port === 443 || port === 8443 ? "https" : "http";
+      const url = `${protocol}://${ip}:${port}/favicon.ico?_t=${Date.now()}`;
+
+      const controller = new AbortController();
+      setTimeout(() => {
+        try {
+          controller.abort();
+        } catch {}
+      }, timeoutMs - 20);
+
+      fetch(url, {
+        method: "GET",
+        mode: "no-cors",
+        cache: "no-store",
+        signal: controller.signal
       })
-      .catch(() => {
-        clearTimeout(timer);
-        resolve({ open: false, ping: 0 });
-      });
+        .then(() => finish(true))
+        .catch(() => {});
+    } catch {}
+
+    // 2. Image tag probe (works across browsers without PNA / CORS rejections)
+    if (typeof Image !== "undefined" && port !== 443 && port !== 8443) {
+      try {
+        const img = new Image();
+        img.onload = () => finish(true);
+        img.onerror = () => {
+          const elapsed = performance.now() - start;
+          if (elapsed < timeoutMs - 60 && elapsed > 20) {
+            finish(true);
+          }
+        };
+        img.src = `http://${ip}:${port}/favicon.ico?_t=${Date.now()}`;
+      } catch {}
+    }
   });
 }
 
@@ -481,7 +504,7 @@ export async function runClientNetworkScan(
   const localIp = netInfo.localIP;
 
   const discoveredDevices: Device[] = [];
-  const concurrency = 20;
+  const concurrency = 16;
   const queue = [...ips];
 
   async function worker() {
@@ -494,7 +517,7 @@ export async function runClientNetworkScan(
       const isLocal = Boolean(localIp && ip === localIp);
 
       // Probe ports concurrently in the browser
-      const probePromises = ports.map((p) => probeClientPort(ip, p, 400));
+      const probePromises = ports.map((p) => probeClientPort(ip, p, 350));
       const results = await Promise.all(probePromises);
 
       const openPorts: number[] = [];

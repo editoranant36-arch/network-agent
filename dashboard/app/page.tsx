@@ -63,7 +63,7 @@ export default function Home() {
     abortControllerRef.current = controller;
 
     try {
-      const scanPorts = [21, 22, 53, 80, 135, 139, 443, 445, 1883, 3000, 3389, 5000, 5353, 8000, 8080, 8443, 9000];
+      const scanPorts = [80, 443, 8080, 8443, 3000, 5000, 8000, 9000];
 
       const results = await runClientNetworkScan(
         cidr,

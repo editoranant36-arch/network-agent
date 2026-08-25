@@ -1,0 +1,10 @@
+services:
+  - type: web
+    name: lan-sentinel
+    runtime: node
+    plan: free
+    buildCommand: npm run build
+    startCommand: npm run start
+    envVars:
+      - key: NODE_VERSION
+        value: 20.18.0

@@ -2,9 +2,13 @@
   "name": "lan-sentinel",
   "version": "1.0.0",
   "private": true,
+  "engines": {
+    "node": ">=18.18.0"
+  },
   "scripts": {
     "dev": "npm --prefix dashboard run dev",
     "build": "npm --prefix dashboard install && npm --prefix dashboard run build",
-    "start": "npm --prefix dashboard run start"
+    "start": "npm --prefix dashboard run start",
+    "postinstall": "npm --prefix dashboard install"
   }
 }

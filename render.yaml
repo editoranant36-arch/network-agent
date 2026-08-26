@@ -1,10 +1,31 @@
 services:
+  # 1. NetLens Diagnostics Agent (Node.js REST API & WebSocket Backend)
   - type: web
-    name: lan-sentinel
+    name: netlens-agent
     runtime: node
     plan: free
-    buildCommand: npm run build
-    startCommand: npm run start
+    rootDir: netlens-agent
+    buildCommand: npm install && npm run build
+    startCommand: npm start
     envVars:
       - key: NODE_VERSION
         value: 20.18.0
+      - key: PORT
+        value: 4000
+
+  # 2. LAN Sentinel Web Dashboard (Next.js Fullstack UI)
+  - type: web
+    name: lan-sentinel-dashboard
+    runtime: node
+    plan: free
+    rootDir: dashboard
+    buildCommand: npm install && npm run build
+    startCommand: npm start
+    envVars:
+      - key: NODE_VERSION
+        value: 20.18.0
+      - key: NEXT_PUBLIC_AGENT_URL
+        fromService:
+          type: web
+          name: netlens-agent
+          property: host

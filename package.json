@@ -7,11 +7,15 @@
   },
   "scripts": {
     "dev": "npm --prefix dashboard run dev",
-    "build": "npm --prefix dashboard install && npm --prefix dashboard run build",
+    "dev:agent": "npm --prefix netlens-agent run dev",
+    "build": "npm run build:agent && npm run build:dashboard",
+    "build:agent": "npm --prefix netlens-agent install && npm --prefix netlens-agent run build",
+    "build:dashboard": "npm --prefix dashboard install && npm --prefix dashboard run build",
     "start": "npm --prefix dashboard run start",
-    "postinstall": "npm --prefix dashboard install",
-    "agent:go": "cd agent-go && go run main.go",
+    "start:agent": "npm --prefix netlens-agent run start",
+    "start:dashboard": "npm --prefix dashboard run start",
     "agent:node": "npm --prefix netlens-agent run dev",
+    "agent:go": "cd agent-go && go run main.go",
     "agent:rust": "cargo run --manifest-path scanner-rs/Cargo.toml --",
     "electron": "electron electron/main.js"
   }

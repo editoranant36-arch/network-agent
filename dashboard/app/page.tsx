@@ -18,12 +18,22 @@ interface AgentStatus {
   uptimeSeconds?: number;
   goAgentOnline?: boolean;
   netlensAgentOnline?: boolean;
+  port?: number;
+  version?: string;
 }
 
 export default function Home() {
   const [cidr, setCidr] = useState("192.168.0.0/24");
   const [profile, setProfile] = useState<NetworkProfile | null>(null);
   const [agentStatus, setAgentStatus] = useState<AgentStatus | null>(null);
+  const [agentType, setAgentType] = useState<"netlens" | "nextjs" | "browser">("netlens");
+  const [agentUrl, setAgentUrl] = useState<string>("");
+  const [agentLatency, setAgentLatency] = useState<number | null>(null);
+  const [showAgentConfig, setShowAgentConfig] = useState(false);
+  const [customUrlInput, setCustomUrlInput] = useState("");
+  const [testResult, setTestResult] = useState<{ ok: boolean; msg: string } | null>(null);
+  const [testingConnection, setTestingConnection] = useState(false);
+
   const [devices, setDevices] = useState<Device[]>([]);
   const [busy, setBusy] = useState(false);
   const [progress, setProgress] = useState(0);
@@ -31,36 +41,103 @@ export default function Home() {
   const [error, setError] = useState("");
   const [selected, setSelected] = useState<Device | null>(null);
   const [lastScanned, setLastScanned] = useState<string | null>(null);
+
   const abortControllerRef = useRef<AbortController | null>(null);
   const eventSourceRef = useRef<EventSource | null>(null);
   const autoScanTriggeredRef = useRef(false);
 
-  // Initialize network info and auto-detect Wi-Fi type from Backend Agent
+  // 1. Initialize Agent URL and Network Info on mount
   useEffect(() => {
-    // 1. Restore previous session in-memory devices if present
+    // Restore cached session devices if available
     try {
       const cached = sessionStorage.getItem("lan_devices");
       const cachedTime = sessionStorage.getItem("lan_last_scan");
-      if (cached) {
-        setDevices(JSON.parse(cached));
-      }
-      if (cachedTime) {
-        setLastScanned(cachedTime);
+      if (cached) setDevices(JSON.parse(cached));
+      if (cachedTime) setLastScanned(cachedTime);
+    } catch {}
+
+    // Determine initial NetLens Agent URL
+    const envUrl = process.env.NEXT_PUBLIC_AGENT_URL;
+    let initialUrl = "http://127.0.0.1:4000";
+    try {
+      const saved = localStorage.getItem("netlens_agent_url");
+      if (saved) initialUrl = saved;
+      else if (envUrl) initialUrl = envUrl;
+    } catch {}
+
+    setAgentUrl(initialUrl);
+    setCustomUrlInput(initialUrl);
+
+    // Check Agent and Network
+    bootstrapAgent(initialUrl);
+  }, []);
+
+  async function bootstrapAgent(targetUrl: string) {
+    const cleanUrl = targetUrl.replace(/\/$/, "");
+    let connected = false;
+
+    // A. Check NetLens Agent first
+    try {
+      const start = performance.now();
+      const res = await fetch(`${cleanUrl}/api/agent/status`, {
+        signal: AbortSignal.timeout(1500)
+      });
+      if (res.ok) {
+        const data: AgentStatus = await res.json();
+        const latency = Math.round(performance.now() - start);
+        setAgentStatus(data);
+        setAgentType("netlens");
+        setAgentLatency(latency);
+        connected = true;
+
+        // Fetch network profile from NetLens Agent
+        fetchNetworkProfile(`${cleanUrl}/api/network`);
+        // Fetch cached devices
+        fetchDevices(`${cleanUrl}/api/devices`);
+        return;
       }
     } catch {}
 
-    // 2. Fetch Backend Agent Status
-    fetch("/api/agent/status")
-      .then((r) => r.json())
-      .then((statusData: AgentStatus) => {
-        setAgentStatus(statusData);
-      })
-      .catch(() => {});
+    // B. Fallback to local Next.js Backend
+    if (!connected) {
+      try {
+        const start = performance.now();
+        const res = await fetch("/api/agent/status", { signal: AbortSignal.timeout(1500) });
+        if (res.ok) {
+          const data: AgentStatus = await res.json();
+          const latency = Math.round(performance.now() - start);
+          setAgentStatus(data);
+          setAgentType("nextjs");
+          setAgentLatency(latency);
+          connected = true;
 
-    // 3. Fetch Real System Network Profile from Backend Agent
-    fetch("/api/network")
-      .then((r) => r.json())
-      .then((netProfile: NetworkProfile) => {
+          // Fetch network profile from Next.js backend
+          fetchNetworkProfile("/api/network");
+          fetchDevices("/api/devices");
+          return;
+        }
+      } catch {}
+    }
+
+    // C. Fallback to Browser Client Scanner Engine
+    if (!connected) {
+      setAgentType("browser");
+      setAgentStatus({
+        status: "online",
+        engine: "In-Browser Client Scanner Engine",
+        hostname: typeof window !== "undefined" ? window.location.hostname : "localhost",
+        os: "Client Browser Sandbox",
+        arch: "wasm / js"
+      });
+      fallbackClientDetection();
+    }
+  }
+
+  async function fetchNetworkProfile(endpoint: string) {
+    try {
+      const res = await fetch(endpoint, { signal: AbortSignal.timeout(3000) });
+      if (res.ok) {
+        const netProfile: NetworkProfile = await res.json();
         if (netProfile && netProfile.cidr) {
           setProfile(netProfile);
           setCidr(netProfile.cidr);
@@ -68,27 +145,27 @@ export default function Home() {
             autoScanTriggeredRef.current = true;
             triggerAutoScan(netProfile.cidr);
           }
-        } else {
-          fallbackClientDetection();
+          return;
         }
-      })
-      .catch(() => {
-        fallbackClientDetection();
-      });
+      }
+    } catch {}
+    fallbackClientDetection();
+  }
 
-    // 4. Load any active devices from backend memory
-    fetch("/api/devices")
-      .then((r) => r.json())
-      .then((res) => {
-        if (res && Array.isArray(res.devices) && res.devices.length > 0) {
-          setDevices((prev) => (prev.length > 0 ? prev : res.devices));
-          if (res.last_scan) {
-            setLastScanned(new Date(res.last_scan).toLocaleTimeString());
+  async function fetchDevices(endpoint: string) {
+    try {
+      const res = await fetch(endpoint, { signal: AbortSignal.timeout(2000) });
+      if (res.ok) {
+        const data = await res.json();
+        if (data && Array.isArray(data.devices) && data.devices.length > 0) {
+          setDevices((prev) => (prev.length > 0 ? prev : data.devices));
+          if (data.last_scan) {
+            setLastScanned(new Date(data.last_scan).toLocaleTimeString());
           }
         }
-      })
-      .catch(() => {});
-  }, []);
+      }
+    } catch {}
+  }
 
   function fallbackClientDetection() {
     detectBrowserNetworkProfile()
@@ -107,11 +184,10 @@ export default function Home() {
     executeScan(targetCidr || cidr);
   }
 
-  // Backend-Powered Complete Network Scan with Real-Time Event Streaming
+  // Network Scan Execution: Streams from NetLens Backend, Next.js API, or Browser Fallback
   async function executeScan(targetCidr: string) {
     if (busy) return;
 
-    // Clear previous scan data for a clean fresh scan
     setDevices([]);
     try {
       sessionStorage.removeItem("lan_devices");
@@ -120,133 +196,137 @@ export default function Home() {
     setBusy(true);
     setError("");
     setProgress(5);
-    setProgressText(`Connecting to Backend Agent & analyzing ${profile?.ssid || "network"}...`);
+    setProgressText(`Connecting to ${agentType === "netlens" ? "NetLens Agent" : "Backend Agent"} & analyzing network...`);
 
     const controller = new AbortController();
     abortControllerRef.current = controller;
 
-    // Try backend streaming scan via SSE first
-    try {
-      let streamSucceeded = false;
-      const discoveredMap = new Map<string, Device>();
+    const cleanAgentUrl = agentUrl.replace(/\/$/, "");
+    const baseApiUrl = agentType === "netlens" ? cleanAgentUrl : "";
 
-      const streamUrl = `/api/scan/stream?cidr=${encodeURIComponent(targetCidr)}`;
-      const eventSource = new EventSource(streamUrl);
-      eventSourceRef.current = eventSource;
+    // Method 1: Real-Time SSE Stream (from NetLens Agent or Next.js)
+    if (agentType !== "browser") {
+      try {
+        let streamSucceeded = false;
+        const discoveredMap = new Map<string, Device>();
+        const streamUrl = `${baseApiUrl}/api/scan/stream?cidr=${encodeURIComponent(targetCidr)}`;
 
-      await new Promise<void>((resolve, reject) => {
-        eventSource.addEventListener("status", (e: any) => {
-          try {
-            const data = JSON.parse(e.data);
-            setProgressText(data.message || "Backend Agent sweeping subnet...");
-            setProgress((p) => Math.max(p, 10));
-          } catch {}
-        });
+        const eventSource = new EventSource(streamUrl);
+        eventSourceRef.current = eventSource;
 
-        eventSource.addEventListener("progress", (e: any) => {
-          try {
-            const data = JSON.parse(e.data);
-            const pct = data.percentage || Math.round((data.scanned / data.total) * 100);
-            setProgress(pct);
-            const currentIpText = data.currentIp ? ` · Probing ${data.currentIp}` : "";
-            setProgressText(`Backend Agent sweeping subnet: ${pct}% (${data.scanned}/${data.total} IPs)${currentIpText}`);
-          } catch {}
-        });
+        await new Promise<void>((resolve, reject) => {
+          eventSource.addEventListener("status", (e: any) => {
+            try {
+              const data = JSON.parse(e.data);
+              setProgressText(data.message || "Agent sweeping subnet...");
+              setProgress((p) => Math.max(p, 10));
+            } catch {}
+          });
 
-        eventSource.addEventListener("device", (e: any) => {
-          try {
-            const dev: Device = JSON.parse(e.data);
-            discoveredMap.set(dev.ip, dev);
-            const sorted = Array.from(discoveredMap.values()).sort((a, b) => {
-              const numA = a.ip.split(".").map(Number).reduce((acc, oct) => (acc << 8) + oct, 0) >>> 0;
-              const numB = b.ip.split(".").map(Number).reduce((acc, oct) => (acc << 8) + oct, 0) >>> 0;
-              return numA - numB;
-            });
-            setDevices(sorted);
-          } catch {}
-        });
+          eventSource.addEventListener("progress", (e: any) => {
+            try {
+              const data = JSON.parse(e.data);
+              const pct = data.percentage || Math.round((data.scanned / data.total) * 100);
+              setProgress(pct);
+              const currentIpText = data.currentIp ? ` · Probing ${data.currentIp}` : "";
+              setProgressText(`Agent sweeping subnet: ${pct}% (${data.scanned}/${data.total} IPs)${currentIpText}`);
+            } catch {}
+          });
 
-        eventSource.addEventListener("complete", (e: any) => {
-          streamSucceeded = true;
-          eventSource.close();
-          eventSourceRef.current = null;
-          try {
-            const data = JSON.parse(e.data);
-            if (Array.isArray(data.devices)) {
-              setDevices(data.devices);
-              const timeStr = new Date().toLocaleTimeString();
-              setLastScanned(timeStr);
-              try {
-                sessionStorage.setItem("lan_devices", JSON.stringify(data.devices));
-                sessionStorage.setItem("lan_last_scan", timeStr);
-              } catch {}
-            }
-          } catch {}
-          resolve();
-        });
+          eventSource.addEventListener("device", (e: any) => {
+            try {
+              const dev: Device = JSON.parse(e.data);
+              discoveredMap.set(dev.ip, dev);
+              const sorted = Array.from(discoveredMap.values()).sort((a, b) => {
+                const numA = a.ip.split(".").map(Number).reduce((acc, oct) => (acc << 8) + oct, 0) >>> 0;
+                const numB = b.ip.split(".").map(Number).reduce((acc, oct) => (acc << 8) + oct, 0) >>> 0;
+                return numA - numB;
+              });
+              setDevices(sorted);
+            } catch {}
+          });
 
-        eventSource.addEventListener("error", () => {
-          eventSource.close();
-          eventSourceRef.current = null;
-          if (!streamSucceeded) {
-            reject(new Error("SSE Stream closed or failed"));
-          } else {
-            resolve();
-          }
-        });
-
-        // Timeout fallback for stream initialization
-        setTimeout(() => {
-          if (!streamSucceeded && discoveredMap.size === 0 && progress <= 10) {
+          eventSource.addEventListener("complete", (e: any) => {
+            streamSucceeded = true;
             eventSource.close();
             eventSourceRef.current = null;
-            reject(new Error("Stream timeout"));
-          }
-        }, 15000);
-      });
+            try {
+              const data = JSON.parse(e.data);
+              if (Array.isArray(data.devices)) {
+                setDevices(data.devices);
+                const timeStr = new Date().toLocaleTimeString();
+                setLastScanned(timeStr);
+                try {
+                  sessionStorage.setItem("lan_devices", JSON.stringify(data.devices));
+                  sessionStorage.setItem("lan_last_scan", timeStr);
+                } catch {}
+              }
+            } catch {}
+            resolve();
+          });
 
-      if (streamSucceeded) {
-        setProgress(100);
-        setProgressText("Scan completed successfully by Backend Agent");
-        setBusy(false);
-        return;
+          eventSource.addEventListener("error", () => {
+            eventSource.close();
+            eventSourceRef.current = null;
+            if (!streamSucceeded) {
+              reject(new Error("SSE stream failed"));
+            } else {
+              resolve();
+            }
+          });
+
+          setTimeout(() => {
+            if (!streamSucceeded && discoveredMap.size === 0 && progress <= 10) {
+              eventSource.close();
+              eventSourceRef.current = null;
+              reject(new Error("SSE stream timeout"));
+            }
+          }, 15000);
+        });
+
+        if (streamSucceeded) {
+          setProgress(100);
+          setProgressText(`Scan completed by ${agentType === "netlens" ? "NetLens Agent" : "Backend Agent"}`);
+          setBusy(false);
+          return;
+        }
+      } catch {
+        // Fallback to POST /api/scan
       }
-    } catch {
-      // Stream failed or unsupported, fallback to POST /api/scan
+
+      // Method 2: POST /api/scan REST API
+      try {
+        setProgress(35);
+        setProgressText(`Executing scan via ${baseApiUrl || ""}/api/scan...`);
+
+        const scanRes = await fetch(`${baseApiUrl}/api/scan`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ cidr: targetCidr }),
+          signal: controller.signal
+        });
+
+        if (scanRes.ok) {
+          const results: Device[] = await scanRes.json();
+          setDevices(results);
+          const timeStr = new Date().toLocaleTimeString();
+          setLastScanned(timeStr);
+          try {
+            sessionStorage.setItem("lan_devices", JSON.stringify(results));
+            sessionStorage.setItem("lan_last_scan", timeStr);
+          } catch {}
+          setProgress(100);
+          setProgressText("Scan completed successfully");
+          setBusy(false);
+          return;
+        }
+      } catch {}
     }
 
-    // Fallback 1: Backend POST /api/scan
-    try {
-      setProgress(30);
-      setProgressText("Executing direct backend agent scan via /api/scan...");
-
-      const scanRes = await fetch("/api/scan", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ cidr: targetCidr }),
-        signal: controller.signal
-      });
-
-      if (scanRes.ok) {
-        const results: Device[] = await scanRes.json();
-        setDevices(results);
-        const timeStr = new Date().toLocaleTimeString();
-        setLastScanned(timeStr);
-        try {
-          sessionStorage.setItem("lan_devices", JSON.stringify(results));
-          sessionStorage.setItem("lan_last_scan", timeStr);
-        } catch {}
-        setProgress(100);
-        setProgressText("Backend scan completed successfully");
-        setBusy(false);
-        return;
-      }
-    } catch {}
-
-    // Fallback 2: In-browser Client Scanner (if deployed statically or server API unavailable)
+    // Method 3: In-Browser Client Scanner (Pure Client Engine)
     try {
       setProgress(25);
-      setProgressText("Probing subnet directly via client engine...");
+      setProgressText("Probing subnet directly via client browser engine...");
       const scanPorts = [21, 22, 53, 80, 135, 139, 443, 445, 1883, 3000, 3389, 5000, 5353, 8000, 8080, 8443, 9000];
 
       const results = await runClientNetworkScan(
@@ -313,7 +393,8 @@ export default function Home() {
     try {
       sessionStorage.removeItem("lan_devices");
       sessionStorage.removeItem("lan_last_scan");
-      await fetch("/api/devices", { method: "DELETE" }).catch(() => {});
+      const baseApiUrl = agentType === "netlens" ? agentUrl.replace(/\/$/, "") : "";
+      await fetch(`${baseApiUrl}/api/devices`, { method: "DELETE" }).catch(() => {});
     } catch {}
   }
 
@@ -325,6 +406,40 @@ export default function Home() {
     document.body.appendChild(downloadAnchor);
     downloadAnchor.click();
     downloadAnchor.remove();
+  }
+
+  async function testAndSaveAgentUrl() {
+    setTestingConnection(true);
+    setTestResult(null);
+    const cleanUrl = customUrlInput.trim().replace(/\/$/, "");
+
+    try {
+      const start = performance.now();
+      const res = await fetch(`${cleanUrl}/api/agent/status`, {
+        signal: AbortSignal.timeout(3000)
+      });
+      if (res.ok) {
+        const data = await res.json();
+        const latency = Math.round(performance.now() - start);
+        setAgentUrl(cleanUrl);
+        setAgentType("netlens");
+        setAgentStatus(data);
+        setAgentLatency(latency);
+        localStorage.setItem("netlens_agent_url", cleanUrl);
+        setTestResult({ ok: true, msg: `Connected successfully (${latency}ms)! Engine: ${data.engine || "NetLens Agent"}` });
+        fetchNetworkProfile(`${cleanUrl}/api/network`);
+        setTimeout(() => setShowAgentConfig(false), 1200);
+      } else {
+        setTestResult({ ok: false, msg: `HTTP error ${res.status}: Agent returned non-OK status.` });
+      }
+    } catch (e: any) {
+      setTestResult({
+        ok: false,
+        msg: `Connection failed: ${e?.message || "Ensure the agent is running and accessible."}`
+      });
+    } finally {
+      setTestingConnection(false);
+    }
   }
 
   const stats = useMemo(() => {
@@ -375,24 +490,48 @@ export default function Home() {
             <span className="dot" /> <b>LAN SENTINEL</b>
             <small> intelligent Wi-Fi auto-detection & security monitor</small>
           </div>
+
+          {/* Backend Agent Status Badge */}
           <div
+            onClick={() => setShowAgentConfig(true)}
+            title="Click to configure or test Backend Agent URL"
             style={{
-              background: "#122017",
-              border: "1px solid #1e5430",
-              color: "#4ade80",
-              borderRadius: "14px",
-              padding: "3px 10px",
+              background: agentType === "netlens" ? "#0f2316" : agentType === "nextjs" ? "#0c1b2c" : "#261d0f",
+              border: `1px solid ${agentType === "netlens" ? "#23633b" : agentType === "nextjs" ? "#1e4775" : "#634718"}`,
+              color: agentType === "netlens" ? "#4ade80" : agentType === "nextjs" ? "#60a5fa" : "#fbbf24",
+              borderRadius: "16px",
+              padding: "4px 12px",
               fontSize: "11px",
               fontWeight: 600,
               display: "flex",
               alignItems: "center",
-              gap: "6px"
+              gap: "7px",
+              cursor: "pointer",
+              transition: "all 0.2s"
             }}
           >
-            <span style={{ display: "inline-block", width: "6px", height: "6px", borderRadius: "50%", background: "#4ade80" }} />
-            {agentStatus?.engine || "Backend Agent Online"}
+            <span
+              style={{
+                display: "inline-block",
+                width: "7px",
+                height: "7px",
+                borderRadius: "50%",
+                background: agentType === "netlens" ? "#4ade80" : agentType === "nextjs" ? "#60a5fa" : "#fbbf24"
+              }}
+            />
+            <span>
+              {agentType === "netlens"
+                ? `NetLens Agent Online ${agentLatency ? `(${agentLatency}ms)` : ""}`
+                : agentType === "nextjs"
+                ? "Next.js Core Backend"
+                : "Browser Client Engine"}
+            </span>
+            <span style={{ fontSize: "10px", opacity: 0.7, textDecoration: "underline", marginLeft: "4px" }}>
+              ⚙️ Settings
+            </span>
           </div>
         </div>
+
         <div style={{ display: "flex", gap: "10px", alignItems: "center", flexWrap: "wrap" }}>
           {lastScanned && <small style={{ color: "#8996a9" }}>Last scan: {lastScanned}</small>}
           {deviceList.length > 0 && (
@@ -414,6 +553,130 @@ export default function Home() {
           )}
         </div>
       </header>
+
+      {/* NetLens Agent Configuration Modal */}
+      {showAgentConfig && (
+        <div className="overlay" onClick={() => setShowAgentConfig(false)}>
+          <aside
+            className="advice"
+            onClick={(e) => e.stopPropagation()}
+            style={{ width: "min(560px, 95%)", height: "auto", maxHeight: "90vh", borderRadius: "14px", margin: "auto" }}
+          >
+            <div className="adviceHead">
+              <div>
+                <small style={{ color: "#4ade80" }}>BACKEND AGENT CONNECTIVITY</small>
+                <h2 style={{ fontSize: "24px", margin: "4px 0" }}>NetLens Agent Connection</h2>
+              </div>
+              <button className="close" onClick={() => setShowAgentConfig(false)}>
+                ×
+              </button>
+            </div>
+
+            <div style={{ marginTop: "16px" }}>
+              <p style={{ color: "#9aa8bb", fontSize: "13px", lineHeight: "1.5" }}>
+                Connect your dashboard to the high-speed <b>NetLens Diagnostics Agent</b> running locally or hosted on Render.
+              </p>
+
+              <div style={{ marginTop: "14px" }}>
+                <label style={{ display: "block", fontSize: "12px", color: "#8996a9", marginBottom: "6px", fontWeight: "bold" }}>
+                  AGENT BACKEND URL (HTTP / REST / WEBSOCKET)
+                </label>
+                <div style={{ display: "flex", gap: "8px" }}>
+                  <input
+                    type="text"
+                    value={customUrlInput}
+                    onChange={(e) => setCustomUrlInput(e.target.value)}
+                    placeholder="http://127.0.0.1:4000 or https://your-agent.onrender.com"
+                    style={{
+                      flex: 1,
+                      background: "#0d131d",
+                      border: "1px solid #253143",
+                      borderRadius: "8px",
+                      color: "white",
+                      padding: "10px",
+                      fontSize: "13px"
+                    }}
+                  />
+                  <button
+                    onClick={testAndSaveAgentUrl}
+                    disabled={testingConnection}
+                    style={{ background: "#4ade80", color: "#07101c", fontSize: "13px", padding: "0 16px" }}
+                  >
+                    {testingConnection ? "Connecting..." : "Connect"}
+                  </button>
+                </div>
+              </div>
+
+              {testResult && (
+                <div
+                  style={{
+                    marginTop: "12px",
+                    padding: "10px 14px",
+                    borderRadius: "8px",
+                    fontSize: "13px",
+                    background: testResult.ok ? "#0e2417" : "#2a1212",
+                    border: `1px solid ${testResult.ok ? "#1e5430" : "#5a2222"}`,
+                    color: testResult.ok ? "#75e0b5" : "#ff8f8f"
+                  }}
+                >
+                  {testResult.msg}
+                </div>
+              )}
+
+              <div style={{ marginTop: "18px", padding: "14px", background: "#0e1520", borderRadius: "10px", border: "1px solid #1c2738" }}>
+                <h4 style={{ margin: "0 0 8px", fontSize: "13px", color: "#dce7f5" }}>Current Active Engine</h4>
+                <div style={{ fontSize: "12px", color: "#8da0b8", display: "grid", gap: "4px" }}>
+                  <div>
+                    Engine: <b style={{ color: "#fff" }}>{agentStatus?.engine || "NetLens Node.js Agent"}</b>
+                  </div>
+                  <div>
+                    Host / OS: <b style={{ color: "#fff" }}>{agentStatus?.hostname || "Local"} ({agentStatus?.os || "Linux"})</b>
+                  </div>
+                  <div>
+                    Status: <b style={{ color: "#4ade80" }}>{agentStatus?.status || "Ready"}</b> {agentLatency ? `· Latency: ${agentLatency}ms` : ""}
+                  </div>
+                  <div>
+                    Active URL: <code style={{ color: "#62e6a7" }}>{agentType === "netlens" ? agentUrl : "Next.js Local Server"}</code>
+                  </div>
+                </div>
+              </div>
+
+              <div style={{ marginTop: "16px", display: "flex", gap: "8px", flexWrap: "wrap" }}>
+                <button
+                  onClick={() => {
+                    setCustomUrlInput("http://127.0.0.1:4000");
+                    bootstrapAgent("http://127.0.0.1:4000");
+                    setShowAgentConfig(false);
+                  }}
+                  style={{ background: "#162232", color: "#62e6a7", border: "1px solid #23374d", fontSize: "12px", padding: "8px 12px" }}
+                >
+                  Use Localhost:4000
+                </button>
+                <button
+                  onClick={() => {
+                    setAgentType("nextjs");
+                    bootstrapAgent("");
+                    setShowAgentConfig(false);
+                  }}
+                  style={{ background: "#162232", color: "#60a5fa", border: "1px solid #23374d", fontSize: "12px", padding: "8px 12px" }}
+                >
+                  Use Next.js Core
+                </button>
+                <button
+                  onClick={() => {
+                    setAgentType("browser");
+                    fallbackClientDetection();
+                    setShowAgentConfig(false);
+                  }}
+                  style={{ background: "#162232", color: "#fbbf24", border: "1px solid #23374d", fontSize: "12px", padding: "8px 12px" }}
+                >
+                  Use Browser Engine
+                </button>
+              </div>
+            </div>
+          </aside>
+        </div>
+      )}
 
       {/* Wi-Fi Intelligence Auto-Detection Card */}
       {profile && (
@@ -536,7 +799,7 @@ export default function Home() {
           <h2>Active LAN Systems</h2>
           <span>
             {busy
-              ? `Backend Agent sweeping subnet... (${deviceList.length} active systems found)`
+              ? `Agent sweeping subnet... (${deviceList.length} active systems found)`
               : `${deviceList.length} active systems found`} · click a row for advice
           </span>
         </div>

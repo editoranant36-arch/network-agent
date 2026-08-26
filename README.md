@@ -1,100 +1,140 @@
-# LAN Sentinel — Intelligent Wi-Fi Network Scanner & Agent Ecosystem
+# LAN Sentinel & NetLens Agent Ecosystem
 
-An enterprise-grade, high-speed active Wi-Fi and LAN scanner with automatic network detection, live SSE streaming, defensive security recommendations, and an integrated multi-agent backend architecture.
-
----
-
-## 🚀 Key Features
-
-- **⚡ Automatic Backend Agent Activation**: Automatically runs on website load to auto-detect Wi-Fi SSID, Gateway, CIDR, and execute complete subnet sweeps (IPs 1–254).
-- **📡 Real-Time SSE Streaming**: Live Server-Sent Events stream discovered devices, ping latencies, and progress percentages to the dashboard in real-time.
-- **🛡️ Wi-Fi Intelligence & Defensive Security**: Auto-classifies Personal Home Wi-Fi, Public/Hotspot Networks, and Enterprise LANs with tailored security advice and trust scores.
-- **🔍 Deep Device & Port Fingerprinting**: NetBIOS name resolution (`nbtscan`), reverse DNS PTR, TLS Subject Common Names, ARP table inspection, and IEEE OUI MAC vendor lookup.
-- **💾 Temporary In-Memory Persistence**: Discovered devices are saved in server temporary memory (`/api/devices`) and client session storage.
-- **🔌 Multi-Engine Agent Connectivity**: Seamlessly bridges the Next.js Native Scanner, Go High-Speed Agent, NetLens Node.js Agent, Rust Async Scanner, Electron Desktop, and Chrome Extension.
+An enterprise-grade, high-speed active Wi-Fi and LAN scanner with automatic network detection, live SSE streaming, defensive security recommendations, and an integrated **NetLens Backend Agent** & **Next.js Fullstack Dashboard**.
 
 ---
 
-## 📁 Repository Structure & Modules
+## 🏗️ Architecture Overview
 
 ```
 wifi-network-agent/
-├── dashboard/        # Next.js 16 (Turbopack) Fullstack Dashboard & Core Backend API
+├── netlens-agent/       # 🚀 Node.js / Express / WebSocket Backend Agent (Port 4000)
+│   ├── src/
+│   │   ├── index.ts     # Express REST API, SSE Streaming & WebSocket Server
+│   │   └── network.ts   # Fast Subnet Scanner, OUI MAC Resolution & Port Auditor
+│   ├── package.json
+│   └── tsconfig.json
+│
+├── dashboard/           # 💻 Next.js 16 (Turbopack) Fullstack Dashboard UI (Port 3000)
 │   ├── app/
-│   │   ├── api/
-│   │   │   ├── agent/status/ # Backend agent connectivity & engine status
-│   │   │   ├── devices/      # Temporary in-memory device cache (GET/DELETE)
-│   │   │   ├── network/      # Live network profile (SSID, Gateway, Security, Trust)
-│   │   │   ├── scan/         # Subnet scan POST endpoint
-│   │   │   └── scan/stream/  # Server-Sent Events (SSE) live streaming scanner
-│   │   ├── lib/
-│   │   │   ├── scanner.ts    # Node.js backend high-speed socket & OS scanner engine
-│   │   │   └── clientScanner.ts # In-browser fallback scanner engine
-│   │   └── page.tsx          # Real-time interactive UI dashboard
-├── agent-go/         # High-Performance Go Backend Agent (HTTP :8080 & WebSockets)
-├── netlens-agent/    # TypeScript / Node.js Diagnostics Agent (ws:// :4000)
-├── scanner-rs/       # Rust Async Multi-Threaded TCP/DNS Network Scanner CLI
-├── electron/         # Electron Desktop Application Wrapper
-└── extension/        # Chrome Extension for instant browser popup scanning
+│   │   ├── page.tsx     # Real-time interactive UI with Live Agent Switcher & Settings
+│   │   ├── api/         # Proxy & Core Backend Endpoints (/api/network, /api/scan, etc.)
+│   │   └── lib/         # Client & Server Scanner engines
+│   └── package.json
+│
+├── render.yaml          # ☁️ 1-Click Multi-Service Render Blueprint
+├── agent-go/            # High-Performance Go Agent (:8080)
+├── scanner-rs/          # Rust Async CLI Scanner
+├── electron/            # Desktop Wrapper
+└── extension/           # Chrome Extension
 ```
 
 ---
 
-## 🛠️ Quick Start
+## 🚀 Running Locally
 
-### 1. Run the Dashboard (Primary Backend & UI)
+### 1. Start Both Backend Agent & Dashboard
 
-```bash
-cd dashboard
-npm install
-npm run dev
-```
+You can start both services in separate terminals:
 
-Open [http://localhost:3000](http://localhost:3000). The backend agent will automatically detect your network profile, initiate the subnet sweep, and display all active devices live on the dashboard.
-
-### 2. Optional: Run the Go Backend Agent
-
-```bash
-npm run agent:go
-# or: cd agent-go && go run main.go
-```
-The Go agent starts on `http://127.0.0.1:8080` and is automatically detected by the dashboard.
-
-### 3. Optional: Run the NetLens Diagnostics Agent
-
+#### Terminal 1: Start NetLens Backend Agent
 ```bash
 npm run agent:node
-# or: cd netlens-agent && npm run dev
+# or: cd netlens-agent && npm install && npm run build && npm start
 ```
-Starts the diagnostics WebSocket server on `ws://127.0.0.1:4000`.
+*NetLens Agent starts on `http://127.0.0.1:4000` (REST, SSE stream, and WebSockets).*
 
-### 4. Optional: Run Rust High-Speed Scanner CLI
-
+#### Terminal 2: Start the Web Dashboard UI
 ```bash
-cargo run --manifest-path scanner-rs/Cargo.toml -- --cidr 192.168.0.0/24
+npm run dev
+# or: cd dashboard && npm install && npm run dev
 ```
+*Open [http://localhost:3000](http://localhost:3000) in your browser.*
 
-### 5. Optional: Chrome Extension
-
-1. Open Chrome and go to `chrome://extensions`.
-2. Enable **Developer mode** (top right).
-3. Click **Load unpacked** and select the `extension/` folder.
-4. Click the LAN Sentinel icon in your toolbar to scan directly from Chrome.
+The Dashboard will automatically detect the NetLens Agent on `http://127.0.0.1:4000`, show the **"🟢 NetLens Agent Online"** badge, auto-detect your Wi-Fi SSID / Gateway, and stream live scanning results directly onto your screen.
 
 ---
 
-## 📡 API Endpoints Reference
+## ☁️ How to Deploy Both Files/Services on Render
+
+You can deploy the entire stack to Render using either **Method A (Render Blueprint - Recommended)** or **Method B (Manual Service Creation)**.
+
+### Method A: 1-Click Render Blueprint (`render.yaml`)
+
+The repository includes a pre-configured [`render.yaml`](file:///home/manish/Downloads/wifi-network-agent/render.yaml) file that automatically configures and links both services together on Render.
+
+1. **Push your repository to GitHub / GitLab:**
+   ```bash
+   git add .
+   git commit -m "Configure NetLens backend agent and dashboard for Render"
+   git push origin main
+   ```
+2. Log in to [Render](https://dashboard.render.com/).
+3. Click **New +** → **Blueprint**.
+4. Select your Git repository.
+5. Render will automatically read `render.yaml` and create two web services:
+   - **`netlens-agent`**: Node.js backend on `https://netlens-agent-xxxx.onrender.com`
+   - **`lan-sentinel-dashboard`**: Next.js UI automatically connected to `netlens-agent` via `NEXT_PUBLIC_AGENT_URL`.
+6. Click **Apply**. Both services will build and deploy automatically!
+
+---
+
+### Method B: Manual Web Service Setup on Render
+
+If you prefer to configure each service manually in the Render dashboard:
+
+#### Step 1: Deploy `netlens-agent` (Backend Service)
+1. In Render, click **New +** → **Web Service**.
+2. Select your repository.
+3. Configure the following fields:
+   - **Name**: `netlens-agent`
+   - **Language / Runtime**: `Node`
+   - **Root Directory**: `netlens-agent`
+   - **Build Command**: `npm install && npm run build`
+   - **Start Command**: `npm start`
+   - **Plan**: `Free`
+4. Under **Environment Variables**, add:
+   - `NODE_VERSION` = `20.18.0`
+   - `PORT` = `4000`
+5. Click **Create Web Service**.
+6. Copy the assigned URL (e.g. `https://netlens-agent-xxxx.onrender.com`).
+
+---
+
+#### Step 2: Deploy `dashboard` (Frontend Website)
+1. In Render, click **New +** → **Web Service**.
+2. Select the same repository.
+3. Configure the following fields:
+   - **Name**: `lan-sentinel-dashboard`
+   - **Language / Runtime**: `Node`
+   - **Root Directory**: `dashboard`
+   - **Build Command**: `npm install && npm run build`
+   - **Start Command**: `npm start`
+   - **Plan**: `Free`
+4. Under **Environment Variables**, add:
+   - `NODE_VERSION` = `20.18.0`
+   - `NEXT_PUBLIC_AGENT_URL` = `https://netlens-agent-xxxx.onrender.com` *(paste your NetLens Agent URL from Step 1)*
+5. Click **Create Web Service**.
+6. Once deployed, open your dashboard website URL (e.g. `https://lan-sentinel-dashboard.onrender.com`).
+
+---
+
+## 🔌 Connecting the Dashboard UI to the Agent
+
+The Dashboard UI includes a built-in **Agent Connection Switcher**:
+1. Click the **"⚙️ Settings"** badge next to the agent status in the top bar.
+2. Enter any local URL (`http://127.0.0.1:4000`) or Render URL (`https://your-agent.onrender.com`).
+3. Click **"Connect"** — the dashboard will measure ping latency, verify the REST/SSE endpoints, and immediately route all scanning requests through the chosen agent.
+
+---
+
+## 📡 API Endpoints Summary
 
 | Endpoint | Method | Description |
 | :--- | :--- | :--- |
-| `/api/network` | `GET` | Returns detected network profile (SSID, Gateway, Subnet, Risk, Trust Score). |
-| `/api/scan/stream` | `GET` | SSE stream pushing live scanning progress and discovered devices. |
+| `/api/agent/status` | `GET` | Backend agent health, OS info, and engine type. |
+| `/api/network` | `GET` | Detected network profile (SSID, Gateway, CIDR, Trust Score). |
+| `/api/scan/stream` | `GET` | Live SSE stream pushing scanning progress and newly discovered hosts. |
 | `/api/scan` | `POST` | Executes complete subnet scan and returns JSON array of live devices. |
 | `/api/devices` | `GET` / `DELETE` | Retrieves or clears temporary in-memory scan results. |
-| `/api/agent/status` | `GET` | Returns backend agent health and connected sub-services. |
-
----
-
-## 🔒 Security & Defensive Advice
-
-The system analyzes discovered open services (e.g. SSH `22`, DNS `53`, HTTP `80`, SMB `445`, HTTPS `443`, RDP `3389`, Dev Ports `3000/8080`) and generates targeted defensive hardening recommendations for each host.
+| `ws://HOST:PORT` | `WebSocket`| Real-time WebSocket connection for bidirectional diagnostic events. |

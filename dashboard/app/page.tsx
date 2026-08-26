@@ -26,14 +26,21 @@ export default function Home() {
   const [cidr, setCidr] = useState("192.168.0.0/24");
   const [profile, setProfile] = useState<NetworkProfile | null>(null);
   const [agentStatus, setAgentStatus] = useState<AgentStatus | null>(null);
-  const [agentType, setAgentType] = useState<"netlens" | "nextjs" | "browser">("netlens");
+  const [agentType, setAgentType] = useState<"netlens" | "nextjs" | "browser">("browser");
   const [agentUrl, setAgentUrl] = useState<string>("");
   const [agentLatency, setAgentLatency] = useState<number | null>(null);
+
+  // Modals state
+  const [showDownloadModal, setShowDownloadModal] = useState(true);
   const [showAgentConfig, setShowAgentConfig] = useState(false);
+  const [activeDownloadTab, setActiveDownloadTab] = useState<"quick" | "windows" | "mac" | "linux" | "source">("quick");
+  const [copiedText, setCopiedText] = useState<string | null>(null);
+  const [dontShowAgain, setDontShowAgain] = useState(false);
   const [customUrlInput, setCustomUrlInput] = useState("");
   const [testResult, setTestResult] = useState<{ ok: boolean; msg: string } | null>(null);
   const [testingConnection, setTestingConnection] = useState(false);
 
+  // Scan state
   const [devices, setDevices] = useState<Device[]>([]);
   const [busy, setBusy] = useState(false);
   const [progress, setProgress] = useState(0);
@@ -41,13 +48,23 @@ export default function Home() {
   const [error, setError] = useState("");
   const [selected, setSelected] = useState<Device | null>(null);
   const [lastScanned, setLastScanned] = useState<string | null>(null);
+  const [originUrl, setOriginUrl] = useState("");
 
   const abortControllerRef = useRef<AbortController | null>(null);
   const eventSourceRef = useRef<EventSource | null>(null);
   const autoScanTriggeredRef = useRef(false);
 
-  // 1. Initialize Agent URL and Network Info on mount
+  // 1. Initialize on Mount
   useEffect(() => {
+    if (typeof window !== "undefined") {
+      setOriginUrl(window.location.origin);
+      const hidePref = localStorage.getItem("hide_agent_popup");
+      if (hidePref === "true") {
+        setShowDownloadModal(false);
+        setDontShowAgain(true);
+      }
+    }
+
     // Restore cached session devices if available
     try {
       const cached = sessionStorage.getItem("lan_devices");
@@ -77,9 +94,18 @@ export default function Home() {
     setAgentUrl(preferredUrl);
     setCustomUrlInput(preferredUrl);
 
-    // Bootstrap connection
+    // Bootstrap agent connection
     bootstrapAgent(preferredUrl);
   }, []);
+
+  // 2. Continuous Agent Health & Discovery Polling (checks every 2.5s for live agent startup)
+  useEffect(() => {
+    const timer = setInterval(() => {
+      const checkUrl = agentUrl || "http://127.0.0.1:8080";
+      probeAgentSilently(checkUrl);
+    }, 2500);
+    return () => clearInterval(timer);
+  }, [agentUrl]);
 
   function normalizeAgentUrl(rawUrl: string): string {
     let clean = rawUrl.trim().replace(/\/$/, "");
@@ -87,12 +113,47 @@ export default function Home() {
     if (!clean.startsWith("http://") && !clean.startsWith("https://")) {
       clean = `https://${clean}`;
     }
-    // On Render, public URLs are routed via standard HTTPS (port 443).
-    // If a user entered *.onrender.com:8080 or :4000, strip the port!
     if (clean.includes(".onrender.com:") && !clean.includes("localhost")) {
       clean = clean.replace(/:\d+$/, "");
     }
     return clean;
+  }
+
+  async function probeAgentSilently(targetUrl: string) {
+    const cleanUrl = normalizeAgentUrl(targetUrl);
+    try {
+      const start = performance.now();
+      const res = await fetch(`${cleanUrl}/api/agent/status`, {
+        signal: AbortSignal.timeout(1200)
+      }).catch(() => null);
+
+      if (res && res.ok) {
+        const data: AgentStatus = await res.json();
+        const latency = Math.round(performance.now() - start);
+        setAgentStatus(data);
+        setAgentType("netlens");
+        setAgentLatency(latency);
+        return;
+      }
+
+      // Check /health
+      const healthRes = await fetch(`${cleanUrl}/health`, {
+        signal: AbortSignal.timeout(1200)
+      }).catch(() => null);
+
+      if (healthRes && healthRes.ok) {
+        const latency = Math.round(performance.now() - start);
+        setAgentStatus({
+          status: "online",
+          engine: "Go High-Speed Agent",
+          hostname: "127.0.0.1",
+          os: "Local System",
+          arch: "x86_64 / arm64"
+        });
+        setAgentType("netlens");
+        setAgentLatency(latency);
+      }
+    } catch {}
   }
 
   async function bootstrapAgent(targetUrl: string) {
@@ -132,7 +193,6 @@ export default function Home() {
           return;
         }
 
-        // Fallback to /health on this candidate
         const healthRes = await fetch(`${url}/health`, {
           signal: AbortSignal.timeout(1200)
         }).catch(() => null);
@@ -159,7 +219,7 @@ export default function Home() {
       } catch {}
     }
 
-    // 2. Try Next.js Server Core (Relative URL - works for all devices on LAN and cloud!)
+    // 2. Try Next.js Server Core
     try {
       const start = performance.now();
       const res = await fetch("/api/agent/status", { signal: AbortSignal.timeout(2000) }).catch(() => null);
@@ -169,22 +229,21 @@ export default function Home() {
         setAgentStatus(data);
         setAgentType("nextjs");
         setAgentLatency(latency);
-        setAgentUrl(""); // relative
+        setAgentUrl("");
 
-        // Fetch network profile from Next.js backend
         fetchNetworkProfile("/api/network");
         fetchDevices("/api/devices");
         return;
       }
     } catch {}
 
-    // 3. Fallback to Browser Sandbox Engine
+    // 3. Fallback to Browser Engine
     setAgentType("browser");
     setAgentStatus({
-      status: "online",
+      status: "ready",
       engine: "In-Browser Client Scanner Engine",
       hostname: typeof window !== "undefined" ? window.location.hostname : "localhost",
-      os: "Client Browser Sandbox",
+      os: "Browser Sandbox",
       arch: "wasm / js"
     });
     fallbackClientDetection();
@@ -198,10 +257,6 @@ export default function Home() {
         if (netProfile && netProfile.cidr) {
           setProfile(netProfile);
           setCidr(netProfile.cidr);
-          if (!autoScanTriggeredRef.current) {
-            autoScanTriggeredRef.current = true;
-            triggerAutoScan(netProfile.cidr);
-          }
           return;
         }
       }
@@ -229,19 +284,11 @@ export default function Home() {
       .then((bProfile) => {
         setProfile((prev) => prev || bProfile);
         if (bProfile.cidr) setCidr((prev) => (prev === "192.168.0.0/24" ? bProfile.cidr : prev));
-        if (!autoScanTriggeredRef.current) {
-          autoScanTriggeredRef.current = true;
-          triggerAutoScan(bProfile.cidr);
-        }
       })
       .catch(() => {});
   }
 
-  function triggerAutoScan(targetCidr?: string) {
-    executeScan(targetCidr || cidr);
-  }
-
-  // Network Scan Execution: Streams from NetLens Backend, Next.js API, or Browser Fallback
+  // Network Scan Execution
   async function executeScan(targetCidr: string) {
     if (busy) return;
 
@@ -253,7 +300,7 @@ export default function Home() {
     setBusy(true);
     setError("");
     setProgress(5);
-    setProgressText(`Connecting to ${agentType === "netlens" ? "NetLens Agent" : "Backend Agent"} & analyzing network...`);
+    setProgressText(`Connecting to ${agentType === "netlens" ? "NetLens Agent" : "Subnet Scanner"} & analyzing network...`);
 
     const controller = new AbortController();
     abortControllerRef.current = controller;
@@ -346,8 +393,6 @@ export default function Home() {
         const primaryStreamUrl = `${baseApiUrl}/api/scan/stream?cidr=${encodeURIComponent(targetCidr)}`;
         streamSucceeded = await runSseStream(primaryStreamUrl);
 
-        // If direct agent stream failed (e.g. from remote PC without port 8080 access),
-        // seamlessly fallback to Next.js server proxy /api/scan/stream!
         if (!streamSucceeded && baseApiUrl !== "") {
           setProgressText("Direct agent connection unreachable; routing scan through Next.js Server...");
           streamSucceeded = await runSseStream(`/api/scan/stream?cidr=${encodeURIComponent(targetCidr)}`);
@@ -374,7 +419,6 @@ export default function Home() {
         }).catch(() => null);
 
         if (!scanRes || !scanRes.ok) {
-          // Fallback to Next.js server proxy /api/scan
           scanRes = await fetch(`/api/scan`, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
@@ -400,7 +444,7 @@ export default function Home() {
       } catch {}
     }
 
-    // Method 3: In-Browser Client Scanner (Pure Client Engine)
+    // Method 3: In-Browser Client Scanner (Fallback)
     try {
       setProgress(25);
       setProgressText("Probing subnet directly via client browser engine...");
@@ -449,6 +493,11 @@ export default function Home() {
     executeScan(cidr);
   }
 
+  function startScanFromModal() {
+    setShowDownloadModal(false);
+    executeScan(cidr);
+  }
+
   function stopScan() {
     if (eventSourceRef.current) {
       eventSourceRef.current.close();
@@ -485,6 +534,23 @@ export default function Home() {
     downloadAnchor.remove();
   }
 
+  function copyToClipboard(text: string, id: string) {
+    if (typeof navigator !== "undefined" && navigator.clipboard) {
+      navigator.clipboard.writeText(text);
+      setCopiedText(id);
+      setTimeout(() => setCopiedText(null), 2200);
+    }
+  }
+
+  function handleCloseModal() {
+    if (dontShowAgain) {
+      try {
+        localStorage.setItem("hide_agent_popup", "true");
+      } catch {}
+    }
+    setShowDownloadModal(false);
+  }
+
   async function testAndSaveAgentUrl() {
     setTestingConnection(true);
     setTestResult(null);
@@ -517,7 +583,6 @@ export default function Home() {
         return;
       }
 
-      // Fallback probe to /health or /api/network
       const healthRes = await fetch(`${cleanUrl}/health`, {
         signal: AbortSignal.timeout(3000)
       }).catch(() => null);
@@ -598,6 +663,17 @@ export default function Home() {
     };
   }, [profile]);
 
+  // Terminal one-liners
+  const quickCurlCmd = originUrl
+    ? `curl -sSL ${originUrl}/api/agent/install | bash`
+    : `curl -sSL http://localhost:3000/api/agent/install | bash`;
+
+  const quickPowershellCmd = originUrl
+    ? `irm ${originUrl}/api/agent/install?os=windows | iex`
+    : `irm http://localhost:3000/api/agent/install?os=windows | iex`;
+
+  const isAgentConnected = agentType === "netlens" && agentStatus?.status === "online";
+
   return (
     <main>
       <header>
@@ -606,6 +682,25 @@ export default function Home() {
             <span className="dot" /> <b>LAN SENTINEL</b>
             <small> intelligent Wi-Fi auto-detection & security monitor</small>
           </div>
+
+          {/* Download Agent Button in Header */}
+          <button
+            onClick={() => setShowDownloadModal(true)}
+            style={{
+              background: "#16273c",
+              border: "1px solid #254266",
+              color: "#60a5fa",
+              fontSize: "12px",
+              padding: "5px 12px",
+              borderRadius: "16px",
+              display: "flex",
+              alignItems: "center",
+              gap: "6px"
+            }}
+          >
+            <span>📥</span>
+            <span>Download Agent & Instructions</span>
+          </button>
 
           {/* Backend Agent Status Badge */}
           <div
@@ -627,6 +722,7 @@ export default function Home() {
             }}
           >
             <span
+              className={agentType === "netlens" ? "" : "pulsing"}
               style={{
                 display: "inline-block",
                 width: "7px",
@@ -670,6 +766,409 @@ export default function Home() {
         </div>
       </header>
 
+      {/* 🚀 PRIMARY POPUP: DOWNLOAD & RUN AGENT + INSTRUCTIONS MODAL */}
+      {showDownloadModal && (
+        <div className="overlay" onClick={handleCloseModal}>
+          <div className="agentModal" onClick={(e) => e.stopPropagation()}>
+            <div className="agentModalHeader">
+              <div>
+                <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
+                  <span style={{ fontSize: "20px" }}>⚡</span>
+                  <span style={{ color: "#4ade80", fontSize: "12px", fontWeight: 700, letterSpacing: "0.06em" }}>
+                    NETLENS AGENT QUICK START & DEEP SCANNER
+                  </span>
+                </div>
+                <h2 style={{ fontSize: "26px", margin: "6px 0 2px", color: "#fff" }}>
+                  Download & Run Local Network Agent
+                </h2>
+                <p style={{ color: "#8da0b8", fontSize: "13px", margin: 0, lineHeight: "1.5" }}>
+                  Web browsers restrict raw ICMP pings and ARP hardware discovery. Run the lightweight, open-source Go agent on your machine for full 1-254 subnet sweeps, vendor detection, and latency measurement.
+                </p>
+              </div>
+              <button className="close" onClick={handleCloseModal} title="Close popup">
+                ×
+              </button>
+            </div>
+
+            {/* Live Connection Status Banner */}
+            <div
+              style={{
+                marginTop: "16px",
+                padding: "14px 18px",
+                borderRadius: "12px",
+                background: isAgentConnected ? "#0e2617" : "#161b24",
+                border: `1px solid ${isAgentConnected ? "#1e5e34" : "#283547"}`,
+                display: "flex",
+                justifyContent: "space-between",
+                alignItems: "center",
+                flexWrap: "wrap",
+                gap: "12px"
+              }}
+            >
+              <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
+                <span
+                  className={isAgentConnected ? "" : "pulsing"}
+                  style={{
+                    display: "inline-block",
+                    width: "10px",
+                    height: "10px",
+                    borderRadius: "50%",
+                    background: isAgentConnected ? "#4ade80" : "#fbbf24"
+                  }}
+                />
+                <div>
+                  <div style={{ fontSize: "14px", fontWeight: "bold", color: isAgentConnected ? "#4ade80" : "#fbbf24" }}>
+                    {isAgentConnected
+                      ? "🟢 NetLens Agent Online & Ready to Scan!"
+                      : "🟡 Waiting for Local Agent on http://127.0.0.1:8080..."}
+                  </div>
+                  <div style={{ fontSize: "12px", color: "#94a3b8", marginTop: "2px" }}>
+                    {isAgentConnected
+                      ? `Engine: ${agentStatus?.engine || "Go Subnet Sweeper"} · Host: ${agentStatus?.hostname || "Local"} · Latency: ${agentLatency || 1}ms`
+                      : "Run any command or executable below — this dashboard connects automatically in real-time."}
+                  </div>
+                </div>
+              </div>
+
+              {isAgentConnected ? (
+                <button
+                  onClick={startScanFromModal}
+                  style={{
+                    background: "#4ade80",
+                    color: "#07101c",
+                    fontSize: "13px",
+                    fontWeight: 800,
+                    padding: "10px 18px",
+                    borderRadius: "8px"
+                  }}
+                >
+                  🚀 Launch Deep Network Scan
+                </button>
+              ) : (
+                <button
+                  onClick={() => bootstrapAgent(agentUrl || "http://127.0.0.1:8080")}
+                  style={{
+                    background: "#1c2a3d",
+                    color: "#93c5fd",
+                    border: "1px solid #2d4566",
+                    fontSize: "12px",
+                    padding: "8px 14px",
+                    borderRadius: "8px"
+                  }}
+                >
+                  🔄 Check Status
+                </button>
+              )}
+            </div>
+
+            {/* Platform Selection Tabs */}
+            <div className="tabNav">
+              <button
+                className={`tabBtn ${activeDownloadTab === "quick" ? "active" : ""}`}
+                onClick={() => setActiveDownloadTab("quick")}
+              >
+                ⚡ 1-Click Terminal (Fastest)
+              </button>
+              <button
+                className={`tabBtn ${activeDownloadTab === "windows" ? "active" : ""}`}
+                onClick={() => setActiveDownloadTab("windows")}
+              >
+                🪟 Windows (EXE / PS)
+              </button>
+              <button
+                className={`tabBtn ${activeDownloadTab === "mac" ? "active" : ""}`}
+                onClick={() => setActiveDownloadTab("mac")}
+              >
+                🍎 macOS (Terminal / Binary)
+              </button>
+              <button
+                className={`tabBtn ${activeDownloadTab === "linux" ? "active" : ""}`}
+                onClick={() => setActiveDownloadTab("linux")}
+              >
+                🐧 Linux (Terminal / Binary)
+              </button>
+              <button
+                className={`tabBtn ${activeDownloadTab === "source" ? "active" : ""}`}
+                onClick={() => setActiveDownloadTab("source")}
+              >
+                📦 Go / Node Source
+              </button>
+            </div>
+
+            {/* Tab Contents */}
+            <div style={{ marginTop: "16px" }}>
+              {/* TAB 1: 1-Click Quick Run */}
+              {activeDownloadTab === "quick" && (
+                <div>
+                  <div style={{ fontSize: "13px", color: "#cbd5e1", marginBottom: "8px" }}>
+                    <b>Option A: Linux / macOS Terminal (Paste & Press Enter)</b>
+                  </div>
+                  <div className="codeBox">
+                    <span style={{ wordBreak: "break-all" }}>{quickCurlCmd}</span>
+                    <button
+                      className="copyBtn"
+                      onClick={() => copyToClipboard(quickCurlCmd, "quick-sh")}
+                    >
+                      {copiedText === "quick-sh" ? "✅ Copied" : "📋 Copy"}
+                    </button>
+                  </div>
+
+                  <div style={{ fontSize: "13px", color: "#cbd5e1", marginTop: "16px", marginBottom: "8px" }}>
+                    <b>Option B: Windows PowerShell (Paste & Press Enter)</b>
+                  </div>
+                  <div className="codeBox">
+                    <span style={{ wordBreak: "break-all" }}>{quickPowershellCmd}</span>
+                    <button
+                      className="copyBtn"
+                      onClick={() => copyToClipboard(quickPowershellCmd, "quick-ps")}
+                    >
+                      {copiedText === "quick-ps" ? "✅ Copied" : "📋 Copy"}
+                    </button>
+                  </div>
+                </div>
+              )}
+
+              {/* TAB 2: Windows */}
+              {activeDownloadTab === "windows" && (
+                <div>
+                  <p style={{ color: "#94a3b8", fontSize: "13px", marginTop: 0 }}>
+                    Download the pre-compiled Windows executable or run via PowerShell:
+                  </p>
+
+                  <div style={{ display: "flex", gap: "10px", flexWrap: "wrap", margin: "12px 0" }}>
+                    <a
+                      href="/api/agent/download?os=windows"
+                      download="wifi-agent.exe"
+                      style={{
+                        background: "#2563eb",
+                        color: "#fff",
+                        textDecoration: "none",
+                        padding: "10px 18px",
+                        borderRadius: "8px",
+                        fontWeight: "bold",
+                        fontSize: "13px",
+                        display: "inline-flex",
+                        alignItems: "center",
+                        gap: "6px"
+                      }}
+                    >
+                      ⬇️ Download wifi-agent.exe (Windows 64-bit)
+                    </a>
+                  </div>
+
+                  <div style={{ fontSize: "12px", color: "#94a3b8", marginTop: "12px" }}>
+                    <b>Or run directly via PowerShell:</b>
+                  </div>
+                  <div className="codeBox">
+                    <span>{quickPowershellCmd}</span>
+                    <button className="copyBtn" onClick={() => copyToClipboard(quickPowershellCmd, "win-ps")}>
+                      {copiedText === "win-ps" ? "✅ Copied" : "📋 Copy"}
+                    </button>
+                  </div>
+                </div>
+              )}
+
+              {/* TAB 3: macOS */}
+              {activeDownloadTab === "mac" && (
+                <div>
+                  <p style={{ color: "#94a3b8", fontSize: "13px", marginTop: 0 }}>
+                    Run the 1-liner in Terminal or download the native macOS binary:
+                  </p>
+
+                  <div className="codeBox">
+                    <span>{quickCurlCmd}</span>
+                    <button className="copyBtn" onClick={() => copyToClipboard(quickCurlCmd, "mac-sh")}>
+                      {copiedText === "mac-sh" ? "✅ Copied" : "📋 Copy"}
+                    </button>
+                  </div>
+
+                  <div style={{ display: "flex", gap: "10px", flexWrap: "wrap", marginTop: "14px" }}>
+                    <a
+                      href="/api/agent/download?os=macos&arch=arm64"
+                      download="wifi-agent-mac-arm64"
+                      style={{
+                        background: "#1e293b",
+                        border: "1px solid #334155",
+                        color: "#60a5fa",
+                        textDecoration: "none",
+                        padding: "9px 15px",
+                        borderRadius: "8px",
+                        fontSize: "13px",
+                        fontWeight: 600
+                      }}
+                    >
+                      ⬇️ Apple Silicon Binary (M1/M2/M3/M4)
+                    </a>
+                    <a
+                      href="/api/agent/download?os=macos&arch=x86_64"
+                      download="wifi-agent-mac-intel"
+                      style={{
+                        background: "#1e293b",
+                        border: "1px solid #334155",
+                        color: "#60a5fa",
+                        textDecoration: "none",
+                        padding: "9px 15px",
+                        borderRadius: "8px",
+                        fontSize: "13px",
+                        fontWeight: 600
+                      }}
+                    >
+                      ⬇️ Intel Mac Binary (x86_64)
+                    </a>
+                  </div>
+                </div>
+              )}
+
+              {/* TAB 4: Linux */}
+              {activeDownloadTab === "linux" && (
+                <div>
+                  <p style={{ color: "#94a3b8", fontSize: "13px", marginTop: 0 }}>
+                    Run the installer script or download the standalone Linux binary:
+                  </p>
+
+                  <div className="codeBox">
+                    <span>{quickCurlCmd}</span>
+                    <button className="copyBtn" onClick={() => copyToClipboard(quickCurlCmd, "linux-sh")}>
+                      {copiedText === "linux-sh" ? "✅ Copied" : "📋 Copy"}
+                    </button>
+                  </div>
+
+                  <div style={{ marginTop: "14px" }}>
+                    <a
+                      href="/api/agent/download?os=linux"
+                      download="wifi-agent-linux"
+                      style={{
+                        background: "#1e293b",
+                        border: "1px solid #334155",
+                        color: "#60a5fa",
+                        textDecoration: "none",
+                        padding: "9px 15px",
+                        borderRadius: "8px",
+                        fontSize: "13px",
+                        fontWeight: 600,
+                        display: "inline-flex",
+                        alignItems: "center",
+                        gap: "6px"
+                      }}
+                    >
+                      ⬇️ Download wifi-agent-linux-amd64 (64-bit)
+                    </a>
+                  </div>
+                </div>
+              )}
+
+              {/* TAB 5: Source */}
+              {activeDownloadTab === "source" && (
+                <div>
+                  <p style={{ color: "#94a3b8", fontSize: "13px", marginTop: 0 }}>
+                    Run directly from source repository:
+                  </p>
+
+                  <div style={{ fontSize: "12px", color: "#94a3b8", marginBottom: "4px" }}>Go Agent:</div>
+                  <div className="codeBox">
+                    <span>cd agent-go && go run main.go</span>
+                    <button className="copyBtn" onClick={() => copyToClipboard("cd agent-go && go run main.go", "src-go")}>
+                      {copiedText === "src-go" ? "✅ Copied" : "📋 Copy"}
+                    </button>
+                  </div>
+
+                  <div style={{ fontSize: "12px", color: "#94a3b8", marginTop: "12px", marginBottom: "4px" }}>
+                    Or via root npm script:
+                  </div>
+                  <div className="codeBox">
+                    <span>npm run agent:go</span>
+                    <button className="copyBtn" onClick={() => copyToClipboard("npm run agent:go", "src-npm")}>
+                      {copiedText === "src-npm" ? "✅ Copied" : "📋 Copy"}
+                    </button>
+                  </div>
+                </div>
+              )}
+            </div>
+
+            {/* Step-by-Step Flow */}
+            <div className="stepGrid">
+              <div className="stepBox">
+                <div className="stepNum">1</div>
+                <h4 style={{ margin: "4px 0 6px", fontSize: "14px", color: "#f1f5f9" }}>Run or Download</h4>
+                <p style={{ margin: 0, fontSize: "12px", color: "#8da0b8", lineHeight: "1.5" }}>
+                  Paste the 1-line command in your terminal or launch the downloaded binary.
+                </p>
+              </div>
+
+              <div className="stepBox">
+                <div className="stepNum">2</div>
+                <h4 style={{ margin: "4px 0 6px", fontSize: "14px", color: "#f1f5f9" }}>Daemon Starts</h4>
+                <p style={{ margin: 0, fontSize: "12px", color: "#8da0b8", lineHeight: "1.5" }}>
+                  Agent listens locally on <code>http://127.0.0.1:8080</code> with zero telemetry or tracking.
+                </p>
+              </div>
+
+              <div className="stepBox">
+                <div className="stepNum">3</div>
+                <h4 style={{ margin: "4px 0 6px", fontSize: "14px", color: "#f1f5f9" }}>Deep LAN Sweep</h4>
+                <p style={{ margin: 0, fontSize: "12px", color: "#8da0b8", lineHeight: "1.5" }}>
+                  Dashboard auto-connects and streams active devices, MAC vendors, and open ports live.
+                </p>
+              </div>
+            </div>
+
+            {/* Footer Action Controls */}
+            <div
+              style={{
+                marginTop: "22px",
+                paddingTop: "16px",
+                borderTop: "1px solid #1c2b3e",
+                display: "flex",
+                justifyContent: "space-between",
+                alignItems: "center",
+                flexWrap: "wrap",
+                gap: "12px"
+              }}
+            >
+              <label style={{ display: "flex", alignItems: "center", gap: "8px", fontSize: "12px", color: "#64748b", cursor: "pointer" }}>
+                <input
+                  type="checkbox"
+                  checked={dontShowAgain}
+                  onChange={(e) => setDontShowAgain(e.target.checked)}
+                />
+                <span>Don&apos;t show this popup automatically on startup</span>
+              </label>
+
+              <div style={{ display: "flex", gap: "10px" }}>
+                <button
+                  onClick={() => {
+                    handleCloseModal();
+                    setAgentType("browser");
+                    fallbackClientDetection();
+                    executeScan(cidr);
+                  }}
+                  style={{
+                    background: "#16202e",
+                    color: "#94a3b8",
+                    border: "1px solid #233346",
+                    fontSize: "12px",
+                    padding: "9px 14px"
+                  }}
+                >
+                  🌐 Scan in Browser (No Agent)
+                </button>
+                <button
+                  onClick={startScanFromModal}
+                  style={{
+                    background: isAgentConnected ? "#4ade80" : "#3b82f6",
+                    color: isAgentConnected ? "#07101c" : "#fff",
+                    fontSize: "13px",
+                    padding: "9px 18px"
+                  }}
+                >
+                  {isAgentConnected ? "🚀 Start Deep Scan" : "Close & Continue"}
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* NetLens Agent Configuration Modal */}
       {showAgentConfig && (
         <div className="overlay" onClick={() => setShowAgentConfig(false)}>
@@ -702,7 +1201,7 @@ export default function Home() {
                     type="text"
                     value={customUrlInput}
                     onChange={(e) => setCustomUrlInput(e.target.value)}
-                    placeholder="http://127.0.0.1:4000 or https://your-agent.onrender.com"
+                    placeholder="http://127.0.0.1:8080 or https://your-agent.onrender.com"
                     style={{
                       flex: 1,
                       background: "#0d131d",
@@ -743,7 +1242,7 @@ export default function Home() {
                 <h4 style={{ margin: "0 0 8px", fontSize: "13px", color: "#dce7f5" }}>Current Active Engine</h4>
                 <div style={{ fontSize: "12px", color: "#8da0b8", display: "grid", gap: "4px" }}>
                   <div>
-                    Engine: <b style={{ color: "#fff" }}>{agentStatus?.engine || "NetLens Node.js Agent"}</b>
+                    Engine: <b style={{ color: "#fff" }}>{agentStatus?.engine || "In-Browser Engine"}</b>
                   </div>
                   <div>
                     Host / OS: <b style={{ color: "#fff" }}>{agentStatus?.hostname || "Local"} ({agentStatus?.os || "Linux"})</b>
@@ -855,6 +1354,7 @@ export default function Home() {
         </section>
       )}
 
+      {/* Main Hero & Scan Control */}
       <section className="hero">
         <h1>
           Network <span>Overview</span>
@@ -902,6 +1402,7 @@ export default function Home() {
         )}
       </section>
 
+      {/* Stats Cards */}
       <section className="stats">
         <div>
           <small>ACTIVE ONLINE DEVICES</small>
@@ -917,6 +1418,7 @@ export default function Home() {
         </div>
       </section>
 
+      {/* Active Systems Table */}
       <section className="panel">
         <div className="panelHead">
           <h2>Active LAN Systems</h2>
@@ -1011,6 +1513,7 @@ export default function Home() {
         </div>
       </section>
 
+      {/* Defensive Security Advice Side Drawer */}
       {selected && (
         <div className="overlay" onClick={() => setSelected(null)}>
           <aside className="advice" onClick={(e) => e.stopPropagation()}>

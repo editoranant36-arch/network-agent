@@ -19,12 +19,13 @@ target/
 scanner-rs/target/
 
 # Go binaries
-agent-go/wifi-agent
+agent-go/wifi-agent*
 *.exe
 *.exe~
 *.dll
 *.so
 *.dylib
+!dashboard/public/bin/**
 
 # Environment & Local
 .env

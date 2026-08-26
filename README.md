@@ -28,27 +28,33 @@ wifi-network-agent/
 
 ---
 
-## 🚀 Running Locally
+## 🚀 Quick Start & 1-Click Agent Launch
 
-### 1. Start Both Backend Agent & Dashboard
+When you open the web dashboard in your browser (`http://localhost:3000`), a **Quick Start & Agent Setup** popup will automatically appear with instant download options and 1-click terminal commands:
 
-You can start both services in separate terminals:
+### 1-Click Terminal Run (No Manual Compile Needed):
+- **macOS / Linux:**
+  ```bash
+  curl -sSL http://localhost:3000/api/agent/install | bash
+  ```
+- **Windows (PowerShell):**
+  ```powershell
+  irm http://localhost:3000/api/agent/install?os=windows | iex
+  ```
 
-#### Terminal 1: Start Go Backend Agent
-```bash
-npm run agent:go
-# or: cd agent-go && go run main.go
-```
-*Go Agent starts on `http://127.0.0.1:8080` (REST, SSE stream on `/api/scan/stream`, and WebSockets on `/ws`).*
+### Developer / Local Source Run:
+- **Terminal 1: Start Go Backend Agent**
+  ```bash
+  npm run agent:go
+  # or: cd agent-go && go run main.go
+  ```
+- **Terminal 2: Start Web Dashboard UI**
+  ```bash
+  npm run dev
+  # or: cd dashboard && npm run dev
+  ```
 
-#### Terminal 2: Start the Web Dashboard UI
-```bash
-npm run dev
-# or: cd dashboard && npm install && npm run dev
-```
-*Open [http://localhost:3000](http://localhost:3000) in your browser.*
-
-The Dashboard will automatically detect the Go Agent on `http://127.0.0.1:8080`, show the **"🟢 NetLens Agent Online"** badge, auto-detect your Wi-Fi SSID / Gateway, and stream live scanning results directly onto your screen.
+*As soon as the agent starts on `http://127.0.0.1:8080`, the website automatically detects it in real time, displays `🟢 NetLens Agent Online`, auto-detects your local network subnet, and lets you trigger high-speed 1-254 sweeps with live streaming.*
 
 ---
 

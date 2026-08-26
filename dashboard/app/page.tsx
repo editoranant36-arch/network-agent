@@ -56,20 +56,29 @@ export default function Home() {
       if (cachedTime) setLastScanned(cachedTime);
     } catch {}
 
-    // Determine initial Agent URL
     const envUrl = process.env.NEXT_PUBLIC_AGENT_URL;
-    let initialUrl = "http://127.0.0.1:8080";
+    let preferredUrl = "";
     try {
       const saved = localStorage.getItem("netlens_agent_url");
-      if (saved) initialUrl = saved;
-      else if (envUrl) initialUrl = envUrl;
+      if (saved) preferredUrl = saved;
+      else if (envUrl) preferredUrl = envUrl;
     } catch {}
 
-    setAgentUrl(initialUrl);
-    setCustomUrlInput(initialUrl);
+    // Dynamic initial candidate based on current window location
+    if (!preferredUrl && typeof window !== "undefined") {
+      const host = window.location.hostname;
+      if (window.location.protocol === "http:" && host && host !== "localhost" && host !== "127.0.0.1") {
+        preferredUrl = `http://${host}:8080`;
+      }
+    }
 
-    // Check Agent and Network
-    bootstrapAgent(initialUrl);
+    if (!preferredUrl) preferredUrl = "http://127.0.0.1:8080";
+
+    setAgentUrl(preferredUrl);
+    setCustomUrlInput(preferredUrl);
+
+    // Bootstrap connection
+    bootstrapAgent(preferredUrl);
   }, []);
 
   function normalizeAgentUrl(rawUrl: string): string {
@@ -88,110 +97,97 @@ export default function Home() {
 
   async function bootstrapAgent(targetUrl: string) {
     const cleanUrl = normalizeAgentUrl(targetUrl);
-    let connected = false;
+    const host = typeof window !== "undefined" ? window.location.hostname : "127.0.0.1";
+    const isHttp = typeof window !== "undefined" && window.location.protocol === "http:";
 
-    // A. Check specified Agent URL first (Go agent or Render or NetLens)
-    if (cleanUrl) {
+    const candidates: string[] = [];
+    if (cleanUrl) candidates.push(cleanUrl);
+    if (isHttp && host && host !== "localhost" && host !== "127.0.0.1") {
+      const hostUrl = `http://${host}:8080`;
+      if (!candidates.includes(hostUrl)) candidates.push(hostUrl);
+    }
+    if (isHttp) {
+      if (!candidates.includes("http://127.0.0.1:8080")) candidates.push("http://127.0.0.1:8080");
+    }
+
+    // 1. Try direct agent candidates
+    for (const url of candidates) {
       try {
         const start = performance.now();
-        const res = await fetch(`${cleanUrl}/api/agent/status`, {
-          signal: AbortSignal.timeout(1500)
+        const res = await fetch(`${url}/api/agent/status`, {
+          signal: AbortSignal.timeout(1200)
         }).catch(() => null);
 
         if (res && res.ok) {
           const data: AgentStatus = await res.json();
           const latency = Math.round(performance.now() - start);
+          setAgentUrl(url);
+          setCustomUrlInput(url);
           setAgentStatus(data);
           setAgentType("netlens");
           setAgentLatency(latency);
-          connected = true;
 
-          fetchNetworkProfile(`${cleanUrl}/api/network`);
-          fetchDevices(`${cleanUrl}/api/devices`);
+          fetchNetworkProfile(`${url}/api/network`);
+          fetchDevices(`${url}/api/devices`);
           return;
         }
 
-        // Fallback probe to /health or /api/network on targetUrl
-        const healthRes = await fetch(`${cleanUrl}/health`, {
-          signal: AbortSignal.timeout(1500)
+        // Fallback to /health on this candidate
+        const healthRes = await fetch(`${url}/health`, {
+          signal: AbortSignal.timeout(1200)
         }).catch(() => null);
+
         if (healthRes && healthRes.ok) {
           const healthData = await healthRes.json().catch(() => ({}));
           const latency = Math.round(performance.now() - start);
+          setAgentUrl(url);
+          setCustomUrlInput(url);
           setAgentStatus({
             status: "online",
             engine: healthData.agent === "go" ? "Go High-Speed Agent" : "Remote Backend Agent",
-            hostname: "agent-host",
+            hostname: host,
             os: "Linux",
             arch: "x86_64"
           });
           setAgentType("netlens");
           setAgentLatency(latency);
-          connected = true;
-          fetchNetworkProfile(`${cleanUrl}/api/network`);
-          fetchDevices(`${cleanUrl}/api/devices`);
+
+          fetchNetworkProfile(`${url}/api/network`);
+          fetchDevices(`${url}/api/devices`);
           return;
         }
       } catch {}
     }
 
-    // B. Check local Go Agent on :8080 if targetUrl wasn't 8080
-    if (!connected && cleanUrl !== "http://127.0.0.1:8080") {
-      try {
-        const start = performance.now();
-        const res = await fetch("http://127.0.0.1:8080/api/agent/status", {
-          signal: AbortSignal.timeout(1000)
-        }).catch(() => null);
-        if (res && res.ok) {
-          const data: AgentStatus = await res.json();
-          const latency = Math.round(performance.now() - start);
-          setAgentUrl("http://127.0.0.1:8080");
-          setCustomUrlInput("http://127.0.0.1:8080");
-          setAgentStatus(data);
-          setAgentType("netlens");
-          setAgentLatency(latency);
-          connected = true;
+    // 2. Try Next.js Server Core (Relative URL - works for all devices on LAN and cloud!)
+    try {
+      const start = performance.now();
+      const res = await fetch("/api/agent/status", { signal: AbortSignal.timeout(2000) }).catch(() => null);
+      if (res && res.ok) {
+        const data: AgentStatus = await res.json();
+        const latency = Math.round(performance.now() - start);
+        setAgentStatus(data);
+        setAgentType("nextjs");
+        setAgentLatency(latency);
+        setAgentUrl(""); // relative
 
-          fetchNetworkProfile("http://127.0.0.1:8080/api/network");
-          fetchDevices("http://127.0.0.1:8080/api/devices");
-          return;
-        }
-      } catch {}
-    }
+        // Fetch network profile from Next.js backend
+        fetchNetworkProfile("/api/network");
+        fetchDevices("/api/devices");
+        return;
+      }
+    } catch {}
 
-    // C. Fallback to local Next.js Backend
-    if (!connected) {
-      try {
-        const start = performance.now();
-        const res = await fetch("/api/agent/status", { signal: AbortSignal.timeout(1500) });
-        if (res.ok) {
-          const data: AgentStatus = await res.json();
-          const latency = Math.round(performance.now() - start);
-          setAgentStatus(data);
-          setAgentType("nextjs");
-          setAgentLatency(latency);
-          connected = true;
-
-          // Fetch network profile from Next.js backend
-          fetchNetworkProfile("/api/network");
-          fetchDevices("/api/devices");
-          return;
-        }
-      } catch {}
-    }
-
-    // D. Fallback to Browser Client Scanner Engine
-    if (!connected) {
-      setAgentType("browser");
-      setAgentStatus({
-        status: "online",
-        engine: "In-Browser Client Scanner Engine",
-        hostname: typeof window !== "undefined" ? window.location.hostname : "localhost",
-        os: "Client Browser Sandbox",
-        arch: "wasm / js"
-      });
-      fallbackClientDetection();
-    }
+    // 3. Fallback to Browser Sandbox Engine
+    setAgentType("browser");
+    setAgentStatus({
+      status: "online",
+      engine: "In-Browser Client Scanner Engine",
+      hostname: typeof window !== "undefined" ? window.location.hostname : "localhost",
+      os: "Client Browser Sandbox",
+      arch: "wasm / js"
+    });
+    fallbackClientDetection();
   }
 
   async function fetchNetworkProfile(endpoint: string) {
@@ -267,107 +263,127 @@ export default function Home() {
 
     // Method 1: Real-Time SSE Stream (from NetLens Agent or Next.js)
     if (agentType !== "browser") {
-      try {
-        let streamSucceeded = false;
-        const discoveredMap = new Map<string, Device>();
-        const streamUrl = `${baseApiUrl}/api/scan/stream?cidr=${encodeURIComponent(targetCidr)}`;
+      let streamSucceeded = false;
+      const discoveredMap = new Map<string, Device>();
 
-        const eventSource = new EventSource(streamUrl);
-        eventSourceRef.current = eventSource;
+      const runSseStream = (streamEndpoint: string): Promise<boolean> => {
+        return new Promise((resolve) => {
+          let sDone = false;
+          try {
+            const eventSource = new EventSource(streamEndpoint);
+            eventSourceRef.current = eventSource;
 
-        await new Promise<void>((resolve, reject) => {
-          eventSource.addEventListener("status", (e: any) => {
-            try {
-              const data = JSON.parse(e.data);
-              setProgressText(data.message || "Agent sweeping subnet...");
-              setProgress((p) => Math.max(p, 10));
-            } catch {}
-          });
+            eventSource.addEventListener("status", (e: any) => {
+              try {
+                const data = JSON.parse(e.data);
+                setProgressText(data.message || "Agent sweeping subnet...");
+                setProgress((p) => Math.max(p, 10));
+              } catch {}
+            });
 
-          eventSource.addEventListener("progress", (e: any) => {
-            try {
-              const data = JSON.parse(e.data);
-              const pct = data.percentage || Math.round((data.scanned / data.total) * 100);
-              setProgress(pct);
-              const currentIpText = data.currentIp ? ` · Probing ${data.currentIp}` : "";
-              setProgressText(`Agent sweeping subnet: ${pct}% (${data.scanned}/${data.total} IPs)${currentIpText}`);
-            } catch {}
-          });
+            eventSource.addEventListener("progress", (e: any) => {
+              try {
+                const data = JSON.parse(e.data);
+                const pct = data.percentage || Math.round((data.scanned / data.total) * 100);
+                setProgress(pct);
+                const currentIpText = data.currentIp ? ` · Probing ${data.currentIp}` : "";
+                setProgressText(`Agent sweeping subnet: ${pct}% (${data.scanned}/${data.total} IPs)${currentIpText}`);
+              } catch {}
+            });
 
-          eventSource.addEventListener("device", (e: any) => {
-            try {
-              const dev: Device = JSON.parse(e.data);
-              discoveredMap.set(dev.ip, dev);
-              const sorted = Array.from(discoveredMap.values()).sort((a, b) => {
-                const numA = a.ip.split(".").map(Number).reduce((acc, oct) => (acc << 8) + oct, 0) >>> 0;
-                const numB = b.ip.split(".").map(Number).reduce((acc, oct) => (acc << 8) + oct, 0) >>> 0;
-                return numA - numB;
-              });
-              setDevices(sorted);
-            } catch {}
-          });
+            eventSource.addEventListener("device", (e: any) => {
+              try {
+                const dev: Device = JSON.parse(e.data);
+                discoveredMap.set(dev.ip, dev);
+                const sorted = Array.from(discoveredMap.values()).sort((a, b) => {
+                  const numA = a.ip.split(".").map(Number).reduce((acc, oct) => (acc << 8) + oct, 0) >>> 0;
+                  const numB = b.ip.split(".").map(Number).reduce((acc, oct) => (acc << 8) + oct, 0) >>> 0;
+                  return numA - numB;
+                });
+                setDevices(sorted);
+              } catch {}
+            });
 
-          eventSource.addEventListener("complete", (e: any) => {
-            streamSucceeded = true;
-            eventSource.close();
-            eventSourceRef.current = null;
-            try {
-              const data = JSON.parse(e.data);
-              if (Array.isArray(data.devices)) {
-                setDevices(data.devices);
-                const timeStr = new Date().toLocaleTimeString();
-                setLastScanned(timeStr);
-                try {
-                  sessionStorage.setItem("lan_devices", JSON.stringify(data.devices));
-                  sessionStorage.setItem("lan_last_scan", timeStr);
-                } catch {}
-              }
-            } catch {}
-            resolve();
-          });
-
-          eventSource.addEventListener("error", () => {
-            eventSource.close();
-            eventSourceRef.current = null;
-            if (!streamSucceeded) {
-              reject(new Error("SSE stream failed"));
-            } else {
-              resolve();
-            }
-          });
-
-          setTimeout(() => {
-            if (!streamSucceeded && discoveredMap.size === 0 && progress <= 10) {
+            eventSource.addEventListener("complete", (e: any) => {
+              sDone = true;
               eventSource.close();
               eventSourceRef.current = null;
-              reject(new Error("SSE stream timeout"));
-            }
-          }, 15000);
+              try {
+                const data = JSON.parse(e.data);
+                if (Array.isArray(data.devices)) {
+                  setDevices(data.devices);
+                  const timeStr = new Date().toLocaleTimeString();
+                  setLastScanned(timeStr);
+                  try {
+                    sessionStorage.setItem("lan_devices", JSON.stringify(data.devices));
+                    sessionStorage.setItem("lan_last_scan", timeStr);
+                  } catch {}
+                }
+              } catch {}
+              resolve(true);
+            });
+
+            eventSource.addEventListener("error", () => {
+              eventSource.close();
+              eventSourceRef.current = null;
+              resolve(sDone);
+            });
+
+            setTimeout(() => {
+              if (!sDone && discoveredMap.size === 0 && progress <= 10) {
+                eventSource.close();
+                eventSourceRef.current = null;
+                resolve(false);
+              }
+            }, 12000);
+          } catch {
+            resolve(false);
+          }
         });
+      };
+
+      try {
+        const primaryStreamUrl = `${baseApiUrl}/api/scan/stream?cidr=${encodeURIComponent(targetCidr)}`;
+        streamSucceeded = await runSseStream(primaryStreamUrl);
+
+        // If direct agent stream failed (e.g. from remote PC without port 8080 access),
+        // seamlessly fallback to Next.js server proxy /api/scan/stream!
+        if (!streamSucceeded && baseApiUrl !== "") {
+          setProgressText("Direct agent connection unreachable; routing scan through Next.js Server...");
+          streamSucceeded = await runSseStream(`/api/scan/stream?cidr=${encodeURIComponent(targetCidr)}`);
+        }
 
         if (streamSucceeded) {
           setProgress(100);
-          setProgressText(`Scan completed by ${agentType === "netlens" ? "NetLens Agent" : "Backend Agent"}`);
+          setProgressText("Scan completed successfully");
           setBusy(false);
           return;
         }
-      } catch {
-        // Fallback to POST /api/scan
-      }
+      } catch {}
 
       // Method 2: POST /api/scan REST API
       try {
         setProgress(35);
-        setProgressText(`Executing scan via ${baseApiUrl || ""}/api/scan...`);
+        setProgressText(`Executing scan via /api/scan...`);
 
-        const scanRes = await fetch(`${baseApiUrl}/api/scan`, {
+        let scanRes = await fetch(`${baseApiUrl}/api/scan`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ cidr: targetCidr }),
           signal: controller.signal
-        });
+        }).catch(() => null);
 
-        if (scanRes.ok) {
+        if (!scanRes || !scanRes.ok) {
+          // Fallback to Next.js server proxy /api/scan
+          scanRes = await fetch(`/api/scan`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ cidr: targetCidr }),
+            signal: controller.signal
+          }).catch(() => null);
+        }
+
+        if (scanRes && scanRes.ok) {
           const results: Device[] = await scanRes.json();
           setDevices(results);
           const timeStr = new Date().toLocaleTimeString();
@@ -744,23 +760,16 @@ export default function Home() {
               <div style={{ marginTop: "16px", display: "flex", gap: "8px", flexWrap: "wrap" }}>
                 <button
                   onClick={() => {
-                    setCustomUrlInput("http://127.0.0.1:8080");
-                    bootstrapAgent("http://127.0.0.1:8080");
+                    const host = typeof window !== "undefined" ? window.location.hostname : "127.0.0.1";
+                    const isLocal = host === "localhost" || host === "127.0.0.1";
+                    const target = isLocal ? "http://127.0.0.1:8080" : `http://${host}:8080`;
+                    setCustomUrlInput(target);
+                    bootstrapAgent(target);
                     setShowAgentConfig(false);
                   }}
                   style={{ background: "#162232", color: "#4ade80", border: "1px solid #23374d", fontSize: "12px", padding: "8px 12px" }}
                 >
-                  ⚡ Use Go Agent (:8080)
-                </button>
-                <button
-                  onClick={() => {
-                    setCustomUrlInput("http://127.0.0.1:4000");
-                    bootstrapAgent("http://127.0.0.1:4000");
-                    setShowAgentConfig(false);
-                  }}
-                  style={{ background: "#162232", color: "#62e6a7", border: "1px solid #23374d", fontSize: "12px", padding: "8px 12px" }}
-                >
-                  Use Node Agent (:4000)
+                  ⚡ Use Host Go Agent (:8080)
                 </button>
                 <button
                   onClick={() => {
@@ -770,7 +779,7 @@ export default function Home() {
                   }}
                   style={{ background: "#162232", color: "#60a5fa", border: "1px solid #23374d", fontSize: "12px", padding: "8px 12px" }}
                 >
-                  Use Next.js Core
+                  🚀 Use Next.js Core (Recommended for Remote PCs)
                 </button>
                 <button
                   onClick={() => {
@@ -780,12 +789,12 @@ export default function Home() {
                   }}
                   style={{ background: "#162232", color: "#fbbf24", border: "1px solid #23374d", fontSize: "12px", padding: "8px 12px" }}
                 >
-                  Use Browser Engine
+                  🌐 Use Browser Sandbox
                 </button>
               </div>
 
-              <div style={{ marginTop: "12px", fontSize: "11px", color: "#64748b" }}>
-                💡 <b>Render Tip:</b> On Render, web services use HTTPS on standard port 443. Enter <code>https://your-agent.onrender.com</code> (do not append <code>:8080</code>).
+              <div style={{ marginTop: "12px", fontSize: "11px", color: "#64748b", lineHeight: "1.6" }}>
+                💡 <b>Remote System Tip:</b> When accessing the dashboard from another PC or phone, select <b>Next.js Core</b> to automatically route requests through the host server, or use <code>http://&lt;HOST_IP&gt;:8080</code>.
               </div>
             </div>
           </aside>

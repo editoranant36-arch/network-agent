@@ -56,9 +56,9 @@ export default function Home() {
       if (cachedTime) setLastScanned(cachedTime);
     } catch {}
 
-    // Determine initial NetLens Agent URL
+    // Determine initial Agent URL
     const envUrl = process.env.NEXT_PUBLIC_AGENT_URL;
-    let initialUrl = "http://127.0.0.1:4000";
+    let initialUrl = "http://127.0.0.1:8080";
     try {
       const saved = localStorage.getItem("netlens_agent_url");
       if (saved) initialUrl = saved;
@@ -72,33 +72,94 @@ export default function Home() {
     bootstrapAgent(initialUrl);
   }, []);
 
+  function normalizeAgentUrl(rawUrl: string): string {
+    let clean = rawUrl.trim().replace(/\/$/, "");
+    if (!clean) return "";
+    if (!clean.startsWith("http://") && !clean.startsWith("https://")) {
+      clean = `https://${clean}`;
+    }
+    // On Render, public URLs are routed via standard HTTPS (port 443).
+    // If a user entered *.onrender.com:8080 or :4000, strip the port!
+    if (clean.includes(".onrender.com:") && !clean.includes("localhost")) {
+      clean = clean.replace(/:\d+$/, "");
+    }
+    return clean;
+  }
+
   async function bootstrapAgent(targetUrl: string) {
-    const cleanUrl = targetUrl.replace(/\/$/, "");
+    const cleanUrl = normalizeAgentUrl(targetUrl);
     let connected = false;
 
-    // A. Check NetLens Agent first
-    try {
-      const start = performance.now();
-      const res = await fetch(`${cleanUrl}/api/agent/status`, {
-        signal: AbortSignal.timeout(1500)
-      });
-      if (res.ok) {
-        const data: AgentStatus = await res.json();
-        const latency = Math.round(performance.now() - start);
-        setAgentStatus(data);
-        setAgentType("netlens");
-        setAgentLatency(latency);
-        connected = true;
+    // A. Check specified Agent URL first (Go agent or Render or NetLens)
+    if (cleanUrl) {
+      try {
+        const start = performance.now();
+        const res = await fetch(`${cleanUrl}/api/agent/status`, {
+          signal: AbortSignal.timeout(1500)
+        }).catch(() => null);
 
-        // Fetch network profile from NetLens Agent
-        fetchNetworkProfile(`${cleanUrl}/api/network`);
-        // Fetch cached devices
-        fetchDevices(`${cleanUrl}/api/devices`);
-        return;
-      }
-    } catch {}
+        if (res && res.ok) {
+          const data: AgentStatus = await res.json();
+          const latency = Math.round(performance.now() - start);
+          setAgentStatus(data);
+          setAgentType("netlens");
+          setAgentLatency(latency);
+          connected = true;
 
-    // B. Fallback to local Next.js Backend
+          fetchNetworkProfile(`${cleanUrl}/api/network`);
+          fetchDevices(`${cleanUrl}/api/devices`);
+          return;
+        }
+
+        // Fallback probe to /health or /api/network on targetUrl
+        const healthRes = await fetch(`${cleanUrl}/health`, {
+          signal: AbortSignal.timeout(1500)
+        }).catch(() => null);
+        if (healthRes && healthRes.ok) {
+          const healthData = await healthRes.json().catch(() => ({}));
+          const latency = Math.round(performance.now() - start);
+          setAgentStatus({
+            status: "online",
+            engine: healthData.agent === "go" ? "Go High-Speed Agent" : "Remote Backend Agent",
+            hostname: "agent-host",
+            os: "Linux",
+            arch: "x86_64"
+          });
+          setAgentType("netlens");
+          setAgentLatency(latency);
+          connected = true;
+          fetchNetworkProfile(`${cleanUrl}/api/network`);
+          fetchDevices(`${cleanUrl}/api/devices`);
+          return;
+        }
+      } catch {}
+    }
+
+    // B. Check local Go Agent on :8080 if targetUrl wasn't 8080
+    if (!connected && cleanUrl !== "http://127.0.0.1:8080") {
+      try {
+        const start = performance.now();
+        const res = await fetch("http://127.0.0.1:8080/api/agent/status", {
+          signal: AbortSignal.timeout(1000)
+        }).catch(() => null);
+        if (res && res.ok) {
+          const data: AgentStatus = await res.json();
+          const latency = Math.round(performance.now() - start);
+          setAgentUrl("http://127.0.0.1:8080");
+          setCustomUrlInput("http://127.0.0.1:8080");
+          setAgentStatus(data);
+          setAgentType("netlens");
+          setAgentLatency(latency);
+          connected = true;
+
+          fetchNetworkProfile("http://127.0.0.1:8080/api/network");
+          fetchDevices("http://127.0.0.1:8080/api/devices");
+          return;
+        }
+      } catch {}
+    }
+
+    // C. Fallback to local Next.js Backend
     if (!connected) {
       try {
         const start = performance.now();
@@ -119,7 +180,7 @@ export default function Home() {
       } catch {}
     }
 
-    // C. Fallback to Browser Client Scanner Engine
+    // D. Fallback to Browser Client Scanner Engine
     if (!connected) {
       setAgentType("browser");
       setAgentStatus({
@@ -411,27 +472,66 @@ export default function Home() {
   async function testAndSaveAgentUrl() {
     setTestingConnection(true);
     setTestResult(null);
-    const cleanUrl = customUrlInput.trim().replace(/\/$/, "");
+    const cleanUrl = normalizeAgentUrl(customUrlInput);
+
+    if (!cleanUrl) {
+      setTestResult({ ok: false, msg: "Please enter a valid agent URL or hostname." });
+      setTestingConnection(false);
+      return;
+    }
 
     try {
       const start = performance.now();
-      const res = await fetch(`${cleanUrl}/api/agent/status`, {
-        signal: AbortSignal.timeout(3000)
-      });
-      if (res.ok) {
-        const data = await res.json();
+      let res = await fetch(`${cleanUrl}/api/agent/status`, {
+        signal: AbortSignal.timeout(3500)
+      }).catch(() => null);
+
+      if (res && res.ok) {
+        const data: AgentStatus = await res.json();
         const latency = Math.round(performance.now() - start);
         setAgentUrl(cleanUrl);
         setAgentType("netlens");
         setAgentStatus(data);
         setAgentLatency(latency);
         localStorage.setItem("netlens_agent_url", cleanUrl);
-        setTestResult({ ok: true, msg: `Connected successfully (${latency}ms)! Engine: ${data.engine || "NetLens Agent"}` });
+        setTestResult({ ok: true, msg: `Connected successfully (${latency}ms)! Engine: ${data.engine || "Backend Agent"}` });
         fetchNetworkProfile(`${cleanUrl}/api/network`);
+        fetchDevices(`${cleanUrl}/api/devices`);
         setTimeout(() => setShowAgentConfig(false), 1200);
-      } else {
-        setTestResult({ ok: false, msg: `HTTP error ${res.status}: Agent returned non-OK status.` });
+        return;
       }
+
+      // Fallback probe to /health or /api/network
+      const healthRes = await fetch(`${cleanUrl}/health`, {
+        signal: AbortSignal.timeout(3000)
+      }).catch(() => null);
+
+      if (healthRes && healthRes.ok) {
+        const healthData = await healthRes.json().catch(() => ({}));
+        const latency = Math.round(performance.now() - start);
+        const data: AgentStatus = {
+          status: "online",
+          engine: healthData.agent === "go" ? "Go High-Speed Agent" : "Remote Backend Agent",
+          hostname: "remote-agent",
+          os: "Linux",
+          arch: "x86_64"
+        };
+        setAgentUrl(cleanUrl);
+        setAgentType("netlens");
+        setAgentStatus(data);
+        setAgentLatency(latency);
+        localStorage.setItem("netlens_agent_url", cleanUrl);
+        setTestResult({ ok: true, msg: `Connected successfully (${latency}ms)! Engine: ${data.engine}` });
+        fetchNetworkProfile(`${cleanUrl}/api/network`);
+        fetchDevices(`${cleanUrl}/api/devices`);
+        setTimeout(() => setShowAgentConfig(false), 1200);
+        return;
+      }
+
+      setTestResult({
+        ok: false,
+        msg: `HTTP error: Could not reach agent at ${cleanUrl}. Check URL and ensure agent is running.`
+      });
     } catch (e: any) {
       setTestResult({
         ok: false,
@@ -644,13 +744,23 @@ export default function Home() {
               <div style={{ marginTop: "16px", display: "flex", gap: "8px", flexWrap: "wrap" }}>
                 <button
                   onClick={() => {
+                    setCustomUrlInput("http://127.0.0.1:8080");
+                    bootstrapAgent("http://127.0.0.1:8080");
+                    setShowAgentConfig(false);
+                  }}
+                  style={{ background: "#162232", color: "#4ade80", border: "1px solid #23374d", fontSize: "12px", padding: "8px 12px" }}
+                >
+                  ⚡ Use Go Agent (:8080)
+                </button>
+                <button
+                  onClick={() => {
                     setCustomUrlInput("http://127.0.0.1:4000");
                     bootstrapAgent("http://127.0.0.1:4000");
                     setShowAgentConfig(false);
                   }}
                   style={{ background: "#162232", color: "#62e6a7", border: "1px solid #23374d", fontSize: "12px", padding: "8px 12px" }}
                 >
-                  Use Localhost:4000
+                  Use Node Agent (:4000)
                 </button>
                 <button
                   onClick={() => {
@@ -672,6 +782,10 @@ export default function Home() {
                 >
                   Use Browser Engine
                 </button>
+              </div>
+
+              <div style={{ marginTop: "12px", fontSize: "11px", color: "#64748b" }}>
+                💡 <b>Render Tip:</b> On Render, web services use HTTPS on standard port 443. Enter <code>https://your-agent.onrender.com</code> (do not append <code>:8080</code>).
               </div>
             </div>
           </aside>

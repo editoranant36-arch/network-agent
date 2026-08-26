@@ -735,12 +735,22 @@ export interface AgentStatusInfo {
 }
 
 export async function getBackendAgentStatus(): Promise<AgentStatusInfo> {
+  const targetAgentUrl = process.env.AGENT_URL || process.env.NEXT_PUBLIC_AGENT_URL || "http://127.0.0.1:8080";
   let goOnline = false;
+
   try {
-    const res = await fetch("http://127.0.0.1:8080/api/network", {
-      signal: AbortSignal.timeout(400)
+    const res = await fetch("http://127.0.0.1:8080/api/agent/status", {
+      signal: AbortSignal.timeout(500)
     }).catch(() => null);
-    if (res && res.ok) goOnline = true;
+    if (res && res.ok) {
+      goOnline = true;
+    } else {
+      // Check if remote agent URL is online
+      const remoteRes = await fetch(`${targetAgentUrl.replace(/\/$/, "")}/api/agent/status`, {
+        signal: AbortSignal.timeout(500)
+      }).catch(() => null);
+      if (remoteRes && remoteRes.ok) goOnline = true;
+    }
   } catch {}
 
   let netlensOnline = false;

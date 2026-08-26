@@ -1,17 +1,15 @@
 services:
-  # 1. NetLens Diagnostics Agent (Node.js REST API & WebSocket Backend)
+  # 1. High-Performance Go Diagnostics Agent (REST API, SSE & WebSockets)
   - type: web
-    name: netlens-agent
-    runtime: node
+    name: wifi-agent-go
+    runtime: go
     plan: free
-    rootDir: netlens-agent
-    buildCommand: npm install && npm run build
-    startCommand: npm start
+    rootDir: agent-go
+    buildCommand: go build -o wifi-agent main.go
+    startCommand: ./wifi-agent
     envVars:
-      - key: NODE_VERSION
-        value: 20.18.0
       - key: PORT
-        value: 4000
+        value: 8080
 
   # 2. LAN Sentinel Web Dashboard (Next.js Fullstack UI)
   - type: web
@@ -27,5 +25,5 @@ services:
       - key: NEXT_PUBLIC_AGENT_URL
         fromService:
           type: web
-          name: netlens-agent
+          name: wifi-agent-go
           property: host

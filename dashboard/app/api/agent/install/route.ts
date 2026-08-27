@@ -94,15 +94,21 @@ TARGET_DIR="/tmp/lan-sentinel-agent"
 mkdir -p "$TARGET_DIR"
 TARGET_FILE="$TARGET_DIR/$BIN_NAME"
 DOWNLOAD_URL="$BASE_URL/bin/$BIN_NAME"
+FALLBACK_URL="$BASE_URL/api/agent/download?os=$OS"
 
 echo -e "\\033[1;33m⬇️  Downloading NetLens Agent ($BIN_NAME) from $BASE_URL...\\033[0m"
 
 if command -v curl >/dev/null 2>&1; then
-  curl -sSL -o "$TARGET_FILE" "$DOWNLOAD_URL"
+  curl -sSL -f -o "$TARGET_FILE" "$DOWNLOAD_URL" || curl -sSL -f -o "$TARGET_FILE" "$FALLBACK_URL"
 elif command -v wget >/dev/null 2>&1; then
-  wget -q -O "$TARGET_FILE" "$DOWNLOAD_URL"
+  wget -q -O "$TARGET_FILE" "$DOWNLOAD_URL" || wget -q -O "$TARGET_FILE" "$FALLBACK_URL"
 else
   echo -e "\\033[1;31m❌ Neither curl nor wget was found. Please install curl.\\033[0m"
+  exit 1
+fi
+
+if [ ! -s "$TARGET_FILE" ]; then
+  echo -e "\\033[1;31m❌ Download failed or binary is empty. Please verify dashboard server is running.\\033[0m"
   exit 1
 fi
 
@@ -112,7 +118,7 @@ echo -e "\\033[1;32m✅ Download complete: $TARGET_FILE\\033[0m"
 echo ""
 echo -e "\\033[1;36m============================================================\\033[0m"
 echo -e "\\033[1;32m  🟢 Starting NetLens Agent Daemon on http://127.0.0.1:8080 ...\\033[0m"
-echo -e "\\033[1;33m  🌐 Return to your browser to perform live network sweeps!  \\033[0m"
+echo -e "\\033[1;33m  🌐 Your browser dashboard will auto-detect and scan LAN!   \\033[0m"
 echo -e "\\033[1;30m  ⚠️  Press Ctrl+C at any time to stop the agent.             \\033[0m"
 echo -e "\\033[1;36m============================================================\\033[0m"
 echo ""

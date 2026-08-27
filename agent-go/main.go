@@ -270,6 +270,50 @@ func fpingSweep(cidr string) map[string]int64 {
 	return live
 }
 
+func pingSingleHost(ip string) (bool, int64) {
+	start := time.Now()
+	var cmd *exec.Cmd
+	if runtime.GOOS == "windows" {
+		cmd = exec.Command("ping", "-n", "1", "-w", "400", ip)
+	} else if runtime.GOOS == "darwin" {
+		cmd = exec.Command("ping", "-c", "1", "-W", "400", ip)
+	} else {
+		cmd = exec.Command("ping", "-c", "1", "-W", "1", ip)
+	}
+	err := cmd.Run()
+	latency := time.Since(start).Milliseconds()
+	if latency < 1 {
+		latency = 1
+	}
+	if err == nil {
+		return true, latency
+	}
+	return false, 0
+}
+
+func standardPingSweep(ips []string) map[string]int64 {
+	live := make(map[string]int64)
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, 64)
+
+	for _, ip := range ips {
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(tip string) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			if ok, latency := pingSingleHost(tip); ok {
+				mu.Lock()
+				live[tip] = latency
+				mu.Unlock()
+			}
+		}(ip)
+	}
+	wg.Wait()
+	return live
+}
+
 func queryTLSCN(ip string, port uint16) string {
 	d := &net.Dialer{Timeout: 350 * time.Millisecond}
 	conn, err := tls.DialWithDialer(d, "tcp", net.JoinHostPort(ip, strconv.Itoa(int(port))), &tls.Config{
@@ -362,6 +406,11 @@ func runScanWithCallbacks(
 	}()
 	wgDisc.Wait()
 
+	// Fallback to standard ping sweep if fping is not installed or returned empty
+	if len(fpingMap) == 0 && len(allIPs) > 0 {
+		fpingMap = standardPingSweep(allIPs)
+	}
+
 	arpMap := readARPTable()
 
 	// Seed live hosts map with initial discovery
@@ -423,12 +472,12 @@ func runScanWithCallbacks(
 			defer wgScan.Done()
 			defer func() { <-sem }()
 
-			openPorts, fastestPing := probePortsFast(tip, portsList)
+			openPorts, fastestPing, hostReplied := probePortsFast(tip, portsList)
 			isKnownLive := false
 
 			muRes.Lock()
 			meta, hasMeta := liveHosts[tip]
-			if hasMeta || len(openPorts) > 0 {
+			if hasMeta || hostReplied || len(openPorts) > 0 {
 				isKnownLive = true
 			}
 			muRes.Unlock()
@@ -558,6 +607,25 @@ func runScanWithCallbacks(
 
 	wgScan.Wait()
 
+	// Re-read ARP table to populate MAC and Vendors discovered during network probes
+	postArp := readARPTable()
+	for i := range results {
+		if results[i].MAC == "" {
+			if m, ok := postArp[results[i].IP]; ok && m != "" {
+				results[i].MAC = m
+				if results[i].Vendor == "" {
+					results[i].Vendor = lookupVendor(m)
+					if strings.HasPrefix(results[i].Hostname, "Host-") && results[i].Vendor != "" {
+						results[i].Hostname = fmt.Sprintf("%s Device", results[i].Vendor)
+						if results[i].DNS != nil {
+							*results[i].DNS = results[i].Hostname
+						}
+					}
+				}
+			}
+		}
+	}
+
 	// Sort numerically by IP
 	sort.Slice(results, func(i, j int) bool {
 		ip1 := net.ParseIP(results[i].IP).To4()
@@ -574,9 +642,10 @@ func runScanWithCallbacks(
 	return results, nil
 }
 
-func probePortsFast(ip string, ports []int) ([]uint16, int64) {
+func probePortsFast(ip string, ports []int) ([]uint16, int64, bool) {
 	var open []uint16
 	var fastestPing int64 = 0
+	var hostReplied bool = false
 	var mu sync.Mutex
 	var wg sync.WaitGroup
 
@@ -588,21 +657,35 @@ func probePortsFast(ip string, ports []int) ([]uint16, int64) {
 			start := time.Now()
 			d := net.Dialer{Timeout: 300 * time.Millisecond}
 			conn, err := d.DialContext(context.Background(), "tcp", addr)
+			latency := time.Since(start).Milliseconds()
+			if latency < 1 {
+				latency = 1
+			}
+
+			mu.Lock()
+			defer mu.Unlock()
+
 			if err == nil {
-				latency := time.Since(start).Milliseconds()
 				conn.Close()
-				mu.Lock()
 				open = append(open, uint16(port))
+				hostReplied = true
 				if fastestPing == 0 || latency < fastestPing {
 					fastestPing = latency
 				}
-				mu.Unlock()
+			} else {
+				errStr := strings.ToLower(err.Error())
+				if strings.Contains(errStr, "connection refused") || strings.Contains(errStr, "reset by peer") {
+					hostReplied = true
+					if fastestPing == 0 || latency < fastestPing {
+						fastestPing = latency
+					}
+				}
 			}
 		}(p)
 	}
 
 	wg.Wait()
-	return open, fastestPing
+	return open, fastestPing, hostReplied
 }
 
 func incIP(ip net.IP) {
@@ -702,7 +785,8 @@ func corsMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS, PUT, DELETE")
-		w.Header().Set("Access-Control-Allow-Headers", "Accept, Content-Type, Content-Length, Accept-Encoding, X-CSRF-Token, Authorization")
+		w.Header().Set("Access-Control-Allow-Headers", "*")
+		w.Header().Set("Access-Control-Max-Age", "86400")
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusOK)
 			return
@@ -958,6 +1042,20 @@ func main() {
 		port = "8080"
 	}
 	addr := ":" + port
+
+	// Automatically run an initial non-blocking background discovery
+	go func() {
+		time.Sleep(300 * time.Millisecond)
+		cidr, _ := detectLocalSubnet()
+		if cidr != "" {
+			res, err := runScan(ScanRequest{CIDR: cidr})
+			if err == nil && len(res) > 0 {
+				mu.Lock()
+				devices = res
+				mu.Unlock()
+			}
+		}
+	}()
 
 	fmt.Printf("Go High-Speed Agent listening on %s (PORT=%s)\n", addr, port)
 	if err := http.ListenAndServe(addr, handler); err != nil {

@@ -53,6 +53,78 @@ export default function Home() {
   const abortControllerRef = useRef<AbortController | null>(null);
   const eventSourceRef = useRef<EventSource | null>(null);
   const autoScanTriggeredRef = useRef(false);
+  const isProbingRef = useRef(false);
+
+  function normalizeAgentUrl(rawUrl: string): string {
+    let clean = (rawUrl || "").trim().replace(/\/$/, "");
+    if (!clean) return "";
+    if (!clean.startsWith("http://") && !clean.startsWith("https://")) {
+      clean = `http://${clean}`;
+    }
+    if (clean.includes(".onrender.com:") && !clean.includes("localhost")) {
+      clean = clean.replace(/:\d+$/, "");
+    }
+    return clean;
+  }
+
+  function getAgentCandidates(): string[] {
+    const list: string[] = [];
+    const addCandidate = (url?: string | null) => {
+      if (!url) return;
+      const clean = normalizeAgentUrl(url);
+      if (clean && !list.includes(clean)) list.push(clean);
+    };
+
+    try {
+      addCandidate(localStorage.getItem("netlens_agent_url"));
+    } catch {}
+    if (process.env.NEXT_PUBLIC_AGENT_URL) {
+      addCandidate(process.env.NEXT_PUBLIC_AGENT_URL);
+    }
+    addCandidate(agentUrl);
+    addCandidate(customUrlInput);
+
+    if (typeof window !== "undefined") {
+      const host = window.location.hostname;
+      if (window.location.protocol === "http:" && host && host !== "localhost" && host !== "127.0.0.1") {
+        addCandidate(`http://${host}:8080`);
+      }
+    }
+
+    addCandidate("http://127.0.0.1:8080");
+    addCandidate("http://localhost:8080");
+
+    return list;
+  }
+
+  async function onAgentDetected(url: string, status: AgentStatus, latency: number) {
+    const isFirstAutoTrigger = !autoScanTriggeredRef.current;
+
+    setAgentUrl(url);
+    setCustomUrlInput(url);
+    setAgentStatus(status);
+    setAgentType("netlens");
+    setAgentLatency(latency);
+    try {
+      localStorage.setItem("netlens_agent_url", url);
+    } catch {}
+
+    // 1. Fetch updated network profile & CIDR from the Go agent
+    const netProfile = await fetchNetworkProfile(`${url}/api/network`);
+    const targetCidr = netProfile?.cidr || cidr || "192.168.0.0/24";
+
+    // 2. Fetch existing devices in memory
+    fetchDevices(`${url}/api/devices`);
+
+    // 3. Auto-close download modal when agent connects
+    setShowDownloadModal(false);
+
+    // 4. Auto-launch deep network sweep on fresh agent connect!
+    if (isFirstAutoTrigger) {
+      autoScanTriggeredRef.current = true;
+      executeScan(targetCidr, url);
+    }
+  }
 
   // 1. Initialize on Mount
   useEffect(() => {
@@ -73,183 +145,100 @@ export default function Home() {
       if (cachedTime) setLastScanned(cachedTime);
     } catch {}
 
-    const envUrl = process.env.NEXT_PUBLIC_AGENT_URL;
-    let preferredUrl = "";
-    try {
-      const saved = localStorage.getItem("netlens_agent_url");
-      if (saved) preferredUrl = saved;
-      else if (envUrl) preferredUrl = envUrl;
-    } catch {}
+    const candidates = getAgentCandidates();
+    const initialUrl = candidates[0] || "http://127.0.0.1:8080";
+    setAgentUrl(initialUrl);
+    setCustomUrlInput(initialUrl);
 
-    // Dynamic initial candidate based on current window location
-    if (!preferredUrl && typeof window !== "undefined") {
-      const host = window.location.hostname;
-      if (window.location.protocol === "http:" && host && host !== "localhost" && host !== "127.0.0.1") {
-        preferredUrl = `http://${host}:8080`;
-      }
-    }
-
-    if (!preferredUrl) preferredUrl = "http://127.0.0.1:8080";
-
-    setAgentUrl(preferredUrl);
-    setCustomUrlInput(preferredUrl);
-
-    // Bootstrap agent connection
-    bootstrapAgent(preferredUrl);
+    // Bootstrap initial agent probe
+    probeAllCandidates();
   }, []);
 
-  // 2. Continuous Agent Health & Discovery Polling (checks every 2.5s for live agent startup)
+  // 2. Continuous Fast Agent Auto-Discovery Polling (1s when waiting, 3.5s when connected)
   useEffect(() => {
+    const isConnected = agentType === "netlens" && agentStatus?.status === "online";
+    const intervalMs = isConnected ? 3500 : 1000;
+
     const timer = setInterval(() => {
-      const checkUrl = agentUrl || "http://127.0.0.1:8080";
-      probeAgentSilently(checkUrl);
-    }, 2500);
+      probeAllCandidates();
+    }, intervalMs);
+
     return () => clearInterval(timer);
-  }, [agentUrl]);
+  }, [agentUrl, agentType, agentStatus?.status, cidr]);
 
-  function normalizeAgentUrl(rawUrl: string): string {
-    let clean = rawUrl.trim().replace(/\/$/, "");
-    if (!clean) return "";
-    if (!clean.startsWith("http://") && !clean.startsWith("https://")) {
-      clean = `https://${clean}`;
-    }
-    if (clean.includes(".onrender.com:") && !clean.includes("localhost")) {
-      clean = clean.replace(/:\d+$/, "");
-    }
-    return clean;
-  }
+  async function probeAllCandidates() {
+    if (isProbingRef.current) return;
+    isProbingRef.current = true;
 
-  async function probeAgentSilently(targetUrl: string) {
-    const cleanUrl = normalizeAgentUrl(targetUrl);
     try {
-      const start = performance.now();
-      const res = await fetch(`${cleanUrl}/api/agent/status`, {
-        signal: AbortSignal.timeout(1200)
-      }).catch(() => null);
+      const candidates = getAgentCandidates();
 
-      if (res && res.ok) {
-        const data: AgentStatus = await res.json();
-        const latency = Math.round(performance.now() - start);
-        setAgentStatus(data);
-        setAgentType("netlens");
-        setAgentLatency(latency);
-        return;
+      for (const url of candidates) {
+        try {
+          const start = performance.now();
+          const res = await fetch(`${url}/api/agent/status`, {
+            signal: AbortSignal.timeout(900)
+          }).catch(() => null);
+
+          if (res && res.ok) {
+            const data: AgentStatus = await res.json();
+            const latency = Math.max(1, Math.round(performance.now() - start));
+            await onAgentDetected(url, data, latency);
+            return;
+          }
+
+          const healthRes = await fetch(`${url}/health`, {
+            signal: AbortSignal.timeout(900)
+          }).catch(() => null);
+
+          if (healthRes && healthRes.ok) {
+            const latency = Math.max(1, Math.round(performance.now() - start));
+            const healthData = await healthRes.json().catch(() => ({}));
+            const data: AgentStatus = {
+              status: "online",
+              engine: healthData.agent === "go" ? "Go High-Speed Agent" : "Go High-Speed Agent",
+              hostname: "127.0.0.1",
+              os: "Linux",
+              arch: "x86_64 / arm64"
+            };
+            await onAgentDetected(url, data, latency);
+            return;
+          }
+        } catch {}
       }
 
-      // Check /health
-      const healthRes = await fetch(`${cleanUrl}/health`, {
-        signal: AbortSignal.timeout(1200)
-      }).catch(() => null);
-
-      if (healthRes && healthRes.ok) {
-        const latency = Math.round(performance.now() - start);
-        setAgentStatus({
-          status: "online",
-          engine: "Go High-Speed Agent",
-          hostname: "127.0.0.1",
-          os: "Local System",
-          arch: "x86_64 / arm64"
-        });
-        setAgentType("netlens");
-        setAgentLatency(latency);
+      // If Go agent is not running yet, try Next.js Server Core if not already set
+      if (agentType === "browser") {
+        try {
+          const start = performance.now();
+          const res = await fetch("/api/agent/status", { signal: AbortSignal.timeout(1200) }).catch(() => null);
+          if (res && res.ok) {
+            const data: AgentStatus = await res.json();
+            const latency = Math.max(1, Math.round(performance.now() - start));
+            setAgentStatus(data);
+            setAgentType("nextjs");
+            setAgentLatency(latency);
+            fetchNetworkProfile("/api/network");
+            fetchDevices("/api/devices");
+            return;
+          }
+        } catch {}
       }
-    } catch {}
+    } finally {
+      isProbingRef.current = false;
+    }
   }
 
-  async function bootstrapAgent(targetUrl: string) {
-    const cleanUrl = normalizeAgentUrl(targetUrl);
-    const host = typeof window !== "undefined" ? window.location.hostname : "127.0.0.1";
-    const isHttp = typeof window !== "undefined" && window.location.protocol === "http:";
-
-    const candidates: string[] = [];
-    if (cleanUrl) candidates.push(cleanUrl);
-    if (isHttp && host && host !== "localhost" && host !== "127.0.0.1") {
-      const hostUrl = `http://${host}:8080`;
-      if (!candidates.includes(hostUrl)) candidates.push(hostUrl);
+  async function bootstrapAgent(targetUrl?: string) {
+    if (targetUrl) {
+      const clean = normalizeAgentUrl(targetUrl);
+      setAgentUrl(clean);
+      setCustomUrlInput(clean);
     }
-    if (isHttp) {
-      if (!candidates.includes("http://127.0.0.1:8080")) candidates.push("http://127.0.0.1:8080");
-    }
-
-    // 1. Try direct agent candidates
-    for (const url of candidates) {
-      try {
-        const start = performance.now();
-        const res = await fetch(`${url}/api/agent/status`, {
-          signal: AbortSignal.timeout(1200)
-        }).catch(() => null);
-
-        if (res && res.ok) {
-          const data: AgentStatus = await res.json();
-          const latency = Math.round(performance.now() - start);
-          setAgentUrl(url);
-          setCustomUrlInput(url);
-          setAgentStatus(data);
-          setAgentType("netlens");
-          setAgentLatency(latency);
-
-          fetchNetworkProfile(`${url}/api/network`);
-          fetchDevices(`${url}/api/devices`);
-          return;
-        }
-
-        const healthRes = await fetch(`${url}/health`, {
-          signal: AbortSignal.timeout(1200)
-        }).catch(() => null);
-
-        if (healthRes && healthRes.ok) {
-          const healthData = await healthRes.json().catch(() => ({}));
-          const latency = Math.round(performance.now() - start);
-          setAgentUrl(url);
-          setCustomUrlInput(url);
-          setAgentStatus({
-            status: "online",
-            engine: healthData.agent === "go" ? "Go High-Speed Agent" : "Remote Backend Agent",
-            hostname: host,
-            os: "Linux",
-            arch: "x86_64"
-          });
-          setAgentType("netlens");
-          setAgentLatency(latency);
-
-          fetchNetworkProfile(`${url}/api/network`);
-          fetchDevices(`${url}/api/devices`);
-          return;
-        }
-      } catch {}
-    }
-
-    // 2. Try Next.js Server Core
-    try {
-      const start = performance.now();
-      const res = await fetch("/api/agent/status", { signal: AbortSignal.timeout(2000) }).catch(() => null);
-      if (res && res.ok) {
-        const data: AgentStatus = await res.json();
-        const latency = Math.round(performance.now() - start);
-        setAgentStatus(data);
-        setAgentType("nextjs");
-        setAgentLatency(latency);
-        setAgentUrl("");
-
-        fetchNetworkProfile("/api/network");
-        fetchDevices("/api/devices");
-        return;
-      }
-    } catch {}
-
-    // 3. Fallback to Browser Engine
-    setAgentType("browser");
-    setAgentStatus({
-      status: "ready",
-      engine: "In-Browser Client Scanner Engine",
-      hostname: typeof window !== "undefined" ? window.location.hostname : "localhost",
-      os: "Browser Sandbox",
-      arch: "wasm / js"
-    });
-    fallbackClientDetection();
+    await probeAllCandidates();
   }
 
-  async function fetchNetworkProfile(endpoint: string) {
+  async function fetchNetworkProfile(endpoint: string): Promise<NetworkProfile | null> {
     try {
       const res = await fetch(endpoint, { signal: AbortSignal.timeout(3000) });
       if (res.ok) {
@@ -257,11 +246,12 @@ export default function Home() {
         if (netProfile && netProfile.cidr) {
           setProfile(netProfile);
           setCidr(netProfile.cidr);
-          return;
+          return netProfile;
         }
       }
     } catch {}
     fallbackClientDetection();
+    return null;
   }
 
   async function fetchDevices(endpoint: string) {
@@ -289,8 +279,12 @@ export default function Home() {
   }
 
   // Network Scan Execution
-  async function executeScan(targetCidr: string) {
+  async function executeScan(targetCidr?: string, overrideUrl?: string) {
     if (busy) return;
+
+    const scanCidr = targetCidr || cidr || profile?.cidr || "192.168.0.0/24";
+    const effectiveUrl = overrideUrl ? normalizeAgentUrl(overrideUrl) : normalizeAgentUrl(agentUrl);
+    const isNetlens = overrideUrl ? true : (agentType === "netlens");
 
     setDevices([]);
     try {
@@ -300,16 +294,16 @@ export default function Home() {
     setBusy(true);
     setError("");
     setProgress(5);
-    setProgressText(`Connecting to ${agentType === "netlens" ? "NetLens Agent" : "Subnet Scanner"} & analyzing network...`);
+    setProgressText(`Connecting to ${isNetlens ? "Go High-Speed Agent" : "Subnet Scanner"} & sweeping subnet ${scanCidr}...`);
 
     const controller = new AbortController();
     abortControllerRef.current = controller;
 
-    const cleanAgentUrl = agentUrl.replace(/\/$/, "");
-    const baseApiUrl = agentType === "netlens" ? cleanAgentUrl : "";
+    const cleanAgentUrl = effectiveUrl.replace(/\/$/, "");
+    const baseApiUrl = isNetlens && cleanAgentUrl ? cleanAgentUrl : "";
 
     // Method 1: Real-Time SSE Stream (from NetLens Agent or Next.js)
-    if (agentType !== "browser") {
+    if (isNetlens || agentType === "nextjs") {
       let streamSucceeded = false;
       const discoveredMap = new Map<string, Device>();
 
@@ -390,12 +384,12 @@ export default function Home() {
       };
 
       try {
-        const primaryStreamUrl = `${baseApiUrl}/api/scan/stream?cidr=${encodeURIComponent(targetCidr)}`;
+        const primaryStreamUrl = `${baseApiUrl}/api/scan/stream?cidr=${encodeURIComponent(scanCidr)}`;
         streamSucceeded = await runSseStream(primaryStreamUrl);
 
         if (!streamSucceeded && baseApiUrl !== "") {
           setProgressText("Direct agent connection unreachable; routing scan through Next.js Server...");
-          streamSucceeded = await runSseStream(`/api/scan/stream?cidr=${encodeURIComponent(targetCidr)}`);
+          streamSucceeded = await runSseStream(`/api/scan/stream?cidr=${encodeURIComponent(scanCidr)}`);
         }
 
         if (streamSucceeded) {
@@ -414,7 +408,7 @@ export default function Home() {
         let scanRes = await fetch(`${baseApiUrl}/api/scan`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ cidr: targetCidr }),
+          body: JSON.stringify({ cidr: scanCidr }),
           signal: controller.signal
         }).catch(() => null);
 
@@ -422,7 +416,7 @@ export default function Home() {
           scanRes = await fetch(`/api/scan`, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ cidr: targetCidr }),
+            body: JSON.stringify({ cidr: scanCidr }),
             signal: controller.signal
           }).catch(() => null);
         }
@@ -451,7 +445,7 @@ export default function Home() {
       const scanPorts = [21, 22, 53, 80, 135, 139, 443, 445, 1883, 3000, 3389, 5000, 5353, 8000, 8080, 8443, 9000];
 
       const results = await runClientNetworkScan(
-        targetCidr,
+        scanCidr,
         scanPorts,
         (scanned, total, pct) => {
           setProgress(pct);

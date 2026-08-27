@@ -28,6 +28,42 @@ wifi-network-agent/
 
 ---
 
+
+## 🏗️ Architecture  Design
+
+                    INTERNET
+                       │
+                       ▼
+              ┌─────────────────┐
+              │     VERCEL      │
+              │                 │
+              │ Next.js         │
+              │ Dashboard       │
+              │ API Routes      │
+              └────────┬────────┘
+                       │
+                 HTTPS / WSS
+                       │
+                       ▼
+              ┌─────────────────┐
+              │  LOCAL AGENT    │
+              │                 │
+              │ Node/Python     │
+              │ WebSocket       │
+              │ Scanner Engine  │
+              └────────┬────────┘
+                       │
+                 Local Network
+                       │
+                       ▼
+              ┌─────────────────┐
+              │ Router / Wi-Fi  │
+              └────────┬────────┘
+                       │
+        ┌──────────────┼──────────────┐
+        ▼              ▼              ▼
+     Laptop          Mobile        IoT/PC
+
 ## 🚀 Quick Start & 1-Click Agent Launch
 
 When you open the web dashboard in your browser (`http://localhost:3000`), a **Quick Start & Agent Setup** popup will automatically appear with instant download options and 1-click terminal commands:

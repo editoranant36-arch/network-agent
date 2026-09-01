@@ -64,6 +64,44 @@ wifi-network-agent/
         ▼              ▼              ▼
      Laptop          Mobile        IoT/PC
 
+
+
+
+## 🔄 UML Sequence Diagram
+
+User                Dashboard UI          Go Agent             Local Network
+ |                     |                      |                     |
+ |-- Open Dashboard -->|                      |                     |
+ |                     |-- GET /status ------>|                     |
+ |                     |<-- Online status ----|                     |
+ |                     |-- GET /network ----->|                     |
+ |                     |                      |-- Detect subnet --->|
+ |                     |                      |<-- CIDR/Gateway ----|
+ |                     |<-- Network info -----|                     |
+ |                     |                      |                     |
+ |--  Click "Scan"  -> |                      |                     | 
+ |                     |-- Start SSE stream ->|                     |
+ |                     |<-- Stream started ---|                     |
+ |                     |                      |                     |
+ |                     |                      |====  Discovery =====|
+ |                     |                      |-- ICMP/NetBIOS/ARP->|
+ |                     |                      |<-- Live hosts ------|
+ |                     |                      |                     |
+ |                     |                      |====  Port Scan =====|
+ |                     |                      |-- Probe ports ----->|
+ |                     |                      |-- DNS + MAC lookup->|
+ |                     |                      |<-- Device details --|
+ |                     |<-- Device event -----|                     |
+ |                     |<-- Progress event ---|                     |
+ |                     |                      |                     |
+ |                     |<-- Scan complete ----|                     |
+ |   <-- Show results -|                      |                     |
+ |                     |                      |                     |
+ |                     |==   Live Telemetry ==|                     |
+ |                     |--  WebSocket ------->|                     |
+ |                     |<-- Live updates -----|     (every 2s)      |
+ |                     |                      |                     |
+ 
 ## 🚀 Quick Start & 1-Click Agent Launch
 
 When you open the web dashboard in your browser (`http://localhost:3000`), a **Quick Start & Agent Setup** popup will automatically appear with instant download options and 1-click terminal commands:

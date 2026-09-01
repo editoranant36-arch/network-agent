@@ -67,40 +67,7 @@ wifi-network-agent/
 
 
 
-## 🔄 UML Sequence Diagram
 
-User                Dashboard UI          Go Agent             Local Network
- |                     |                      |                     |
- |-- Open Dashboard -->|                      |                     |
- |                     |-- GET /status ------>|                     |
- |                     |<-- Online status ----|                     |
- |                     |-- GET /network ----->|                     |
- |                     |                      |-- Detect subnet --->|
- |                     |                      |<-- CIDR/Gateway ----|
- |                     |<-- Network info -----|                     |
- |                     |                      |                     |
- |--  Click "Scan"  -> |                      |                     | 
- |                     |-- Start SSE stream ->|                     |
- |                     |<-- Stream started ---|                     |
- |                     |                      |                     |
- |                     |                      |====  Discovery =====|
- |                     |                      |-- ICMP/NetBIOS/ARP->|
- |                     |                      |<-- Live hosts ------|
- |                     |                      |                     |
- |                     |                      |====  Port Scan =====|
- |                     |                      |-- Probe ports ----->|
- |                     |                      |-- DNS + MAC lookup->|
- |                     |                      |<-- Device details --|
- |                     |<-- Device event -----|                     |
- |                     |<-- Progress event ---|                     |
- |                     |                      |                     |
- |                     |<-- Scan complete ----|                     |
- |   <-- Show results -|                      |                     |
- |                     |                      |                     |
- |                     |==   Live Telemetry ==|                     |
- |                     |--  WebSocket ------->|                     |
- |                     |<-- Live updates -----|     (every 2s)      |
- |                     |                      |                     |
  
 ## 🚀 Quick Start & 1-Click Agent Launch
 

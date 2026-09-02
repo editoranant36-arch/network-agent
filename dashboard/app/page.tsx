@@ -8,6 +8,7 @@ import {
   detectBrowserNetworkProfile,
   runClientNetworkScan
 } from "./lib/clientScanner";
+import MarkdownRenderer from "./lib/MarkdownRenderer";
 
 interface AgentStatus {
   status: string;
@@ -49,6 +50,25 @@ export default function Home() {
   const [selected, setSelected] = useState<Device | null>(null);
   const [lastScanned, setLastScanned] = useState<string | null>(null);
   const [originUrl, setOriginUrl] = useState("");
+
+  // Groq AI Summary & Download State
+  const [summary, setSummary] = useState<string | null>(null);
+  const [isGeneratingSummary, setIsGeneratingSummary] = useState(false);
+  const [summaryError, setSummaryError] = useState<string | null>(null);
+  const [showSummaryModal, setShowSummaryModal] = useState(false);
+  const [summaryMeta, setSummaryMeta] = useState<{
+    model?: string;
+    deviceCount?: number;
+    portCount?: number;
+    timestamp?: string;
+  } | null>(null);
+  const [groqKeyInput, setGroqKeyInput] = useState("");
+  const [selectedGroqModel, setSelectedGroqModel] = useState("openai/gpt-oss-120b");
+  const [customAuditFocus, setCustomAuditFocus] = useState("");
+  const [autoSummaryEnabled, setAutoSummaryEnabled] = useState(true);
+  const [showGroqSettings, setShowGroqSettings] = useState(false);
+  const [groqConfigStatus, setGroqConfigStatus] = useState<{ configured: boolean; maskedKey: string } | null>(null);
+  const autoSummaryEnabledRef = useRef(true);
 
   const abortControllerRef = useRef<AbortController | null>(null);
   const eventSourceRef = useRef<EventSource | null>(null);
@@ -143,6 +163,41 @@ export default function Home() {
       const cachedTime = sessionStorage.getItem("lan_last_scan");
       if (cached) setDevices(JSON.parse(cached));
       if (cachedTime) setLastScanned(cachedTime);
+
+      const cachedSummary = sessionStorage.getItem("lan_ai_summary");
+      const cachedMeta = sessionStorage.getItem("lan_ai_summary_meta");
+      if (cachedSummary) setSummary(cachedSummary);
+      if (cachedMeta) setSummaryMeta(JSON.parse(cachedMeta));
+    } catch {}
+
+    // Check Groq status from server
+    fetch("/api/summary")
+      .then((res) => res.json())
+      .then((data) => {
+        if (data && data.status === "ok") {
+          setGroqConfigStatus({
+            configured: data.configured,
+            maskedKey: data.maskedKey
+          });
+          if (data.currentModel) {
+            setSelectedGroqModel(data.currentModel);
+          }
+        }
+      })
+      .catch(() => {});
+
+    // Restore user Groq local preferences
+    try {
+      const savedKey = localStorage.getItem("groq_custom_key");
+      if (savedKey) setGroqKeyInput(savedKey);
+      const savedAuto = localStorage.getItem("groq_auto_summary");
+      if (savedAuto !== null) {
+        const val = savedAuto === "true";
+        setAutoSummaryEnabled(val);
+        autoSummaryEnabledRef.current = val;
+      }
+      const savedModel = localStorage.getItem("groq_model");
+      if (savedModel) setSelectedGroqModel(savedModel);
     } catch {}
 
     const candidates = getAgentCandidates();
@@ -153,6 +208,10 @@ export default function Home() {
     // Bootstrap initial agent probe
     probeAllCandidates();
   }, []);
+
+  useEffect(() => {
+    autoSummaryEnabledRef.current = autoSummaryEnabled;
+  }, [autoSummaryEnabled]);
 
   // 2. Continuous Fast Agent Auto-Discovery Polling (1s when waiting, 3.5s when connected)
   useEffect(() => {
@@ -359,6 +418,9 @@ export default function Home() {
                     sessionStorage.setItem("lan_devices", JSON.stringify(data.devices));
                     sessionStorage.setItem("lan_last_scan", timeStr);
                   } catch {}
+                  if (autoSummaryEnabledRef.current) {
+                    generateAiSummary(data.devices);
+                  }
                 }
               } catch {}
               resolve(true);
@@ -396,6 +458,10 @@ export default function Home() {
           setProgress(100);
           setProgressText("Scan completed successfully");
           setBusy(false);
+          const finalDevices = Array.from(discoveredMap.values());
+          if (autoSummaryEnabledRef.current && finalDevices.length > 0 && !summary) {
+            generateAiSummary(finalDevices);
+          }
           return;
         }
       } catch {}
@@ -433,6 +499,9 @@ export default function Home() {
           setProgress(100);
           setProgressText("Scan completed successfully");
           setBusy(false);
+          if (autoSummaryEnabledRef.current && results.length > 0) {
+            generateAiSummary(results);
+          }
           return;
         }
       } catch {}
@@ -472,6 +541,9 @@ export default function Home() {
         sessionStorage.setItem("lan_devices", JSON.stringify(results));
         sessionStorage.setItem("lan_last_scan", timeStr);
       } catch {}
+      if (autoSummaryEnabledRef.current && results.length > 0) {
+        generateAiSummary(results);
+      }
     } catch (e: any) {
       if (e?.name !== "AbortError") {
         setError(e?.message || "Scan failed");
@@ -510,9 +582,14 @@ export default function Home() {
     setLastScanned(null);
     setProgress(0);
     setProgressText("");
+    setSummary(null);
+    setSummaryMeta(null);
+    setSummaryError(null);
     try {
       sessionStorage.removeItem("lan_devices");
       sessionStorage.removeItem("lan_last_scan");
+      sessionStorage.removeItem("lan_ai_summary");
+      sessionStorage.removeItem("lan_ai_summary_meta");
       const baseApiUrl = agentType === "netlens" ? agentUrl.replace(/\/$/, "") : "";
       await fetch(`${baseApiUrl}/api/devices`, { method: "DELETE" }).catch(() => {});
     } catch {}
@@ -523,6 +600,149 @@ export default function Home() {
     const downloadAnchor = document.createElement("a");
     downloadAnchor.setAttribute("href", dataStr);
     downloadAnchor.setAttribute("download", `network-scan-${Date.now()}.json`);
+    document.body.appendChild(downloadAnchor);
+    downloadAnchor.click();
+    downloadAnchor.remove();
+  }
+
+  async function generateAiSummary(deviceListToUse?: Device[]) {
+    const targetDevices = deviceListToUse && deviceListToUse.length > 0 ? deviceListToUse : devices;
+    setIsGeneratingSummary(true);
+    setSummaryError(null);
+
+    try {
+      const payload = {
+        apiKey: groqKeyInput.trim() || undefined,
+        model: selectedGroqModel,
+        devices: targetDevices,
+        profile: profile,
+        agentStatus: agentStatus,
+        prompt: customAuditFocus.trim() || undefined
+      };
+
+      let res = await fetch("/api/summary", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload)
+      }).catch(() => null);
+
+      if (!res || !res.ok) {
+        const cleanUrl = normalizeAgentUrl(agentUrl);
+        if (agentType === "netlens" && cleanUrl) {
+          res = await fetch(`${cleanUrl}/api/summary`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(payload)
+          }).catch(() => null);
+        }
+      }
+
+      if (!res || !res.ok) {
+        const errText = res ? await res.text().catch(() => "") : "";
+        let errMsg = "Failed to generate AI summary";
+        try {
+          const parsed = JSON.parse(errText);
+          errMsg = parsed.error || parsed.details || errMsg;
+        } catch {
+          if (errText) errMsg = errText;
+        }
+        throw new Error(errMsg);
+      }
+
+      const data = await res.json();
+      if (!data.success || !data.summary) {
+        throw new Error(data.error || "No summary was generated by the AI model.");
+      }
+
+      setSummary(data.summary);
+      const meta = {
+        model: data.model || selectedGroqModel,
+        deviceCount: data.deviceCount != null ? data.deviceCount : targetDevices.length,
+        portCount: data.portCount,
+        timestamp: data.timestamp || new Date().toISOString()
+      };
+      setSummaryMeta(meta);
+
+      try {
+        sessionStorage.setItem("lan_ai_summary", data.summary);
+        sessionStorage.setItem("lan_ai_summary_meta", JSON.stringify(meta));
+      } catch {}
+    } catch (err: any) {
+      console.error("AI Summary generation failed:", err);
+      setSummaryError(err?.message || "Failed to generate AI summary with Groq.");
+    } finally {
+      setIsGeneratingSummary(false);
+    }
+  }
+
+  function downloadSummaryMarkdown() {
+    if (!summary) return;
+    const timeTag = new Date().toISOString().slice(0, 19).replace(/[:T]/g, "-");
+    const filename = `network-security-summary-${timeTag}.md`;
+    const docHeader = `# LAN Sentinel AI Network Security Report\n` +
+      `**Generated:** ${new Date().toLocaleString()}  \n` +
+      `**Subnet CIDR:** \`${cidr || profile?.cidr || "192.168.0.0/24"}\`  \n` +
+      `**SSID:** ${profile?.ssid || "LAN"} (${profile?.security || "Protected"})  \n` +
+      `**Gateway:** ${profile?.gateway || "Default"}  \n` +
+      `**Total Discovered Devices:** ${devices.length}  \n` +
+      `**AI Intelligence Model:** \`${summaryMeta?.model || selectedGroqModel}\` (Groq)  \n\n` +
+      `---\n\n`;
+    const fullText = docHeader + summary;
+    const blob = new Blob([fullText], { type: "text/markdown;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+  }
+
+  function downloadSummaryTxt() {
+    if (!summary) return;
+    const timeTag = new Date().toISOString().slice(0, 19).replace(/[:T]/g, "-");
+    const filename = `network-security-summary-${timeTag}.txt`;
+    const clean = summary
+      .replace(/#{1,6}\s+/g, "")
+      .replace(/\*\*(.*?)\*\*/g, "$1")
+      .replace(/\*(.*?)\*/g, "$1")
+      .replace(/`([^`]+)`/g, "$1");
+    const docHeader = `LAN SENTINEL AI NETWORK SECURITY REPORT\n` +
+      `Generated: ${new Date().toLocaleString()}\n` +
+      `Subnet: ${cidr || profile?.cidr || "192.168.0.0/24"}\n` +
+      `Devices Scanned: ${devices.length}\n` +
+      `AI Model: ${summaryMeta?.model || selectedGroqModel} (Groq)\n` +
+      `============================================================\n\n`;
+    const blob = new Blob([docHeader + clean], { type: "text/plain;charset=utf-8" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+  }
+
+  function copySummaryToClipboard() {
+    if (!summary) return;
+    copyToClipboard(summary, "summary-copy");
+  }
+
+  function exportFullReportJSON() {
+    const report = {
+      generatedAt: new Date().toISOString(),
+      networkProfile: profile,
+      cidr,
+      summaryMeta,
+      aiSummary: summary,
+      devices
+    };
+    const dataStr = "data:text/json;charset=utf-8," + encodeURIComponent(JSON.stringify(report, null, 2));
+    const downloadAnchor = document.createElement("a");
+    downloadAnchor.setAttribute("href", dataStr);
+    downloadAnchor.setAttribute("download", `network-full-report-${Date.now()}.json`);
     document.body.appendChild(downloadAnchor);
     downloadAnchor.click();
     downloadAnchor.remove();
@@ -740,8 +960,52 @@ export default function Home() {
 
         <div style={{ display: "flex", gap: "10px", alignItems: "center", flexWrap: "wrap" }}>
           {lastScanned && <small style={{ color: "#8996a9" }}>Last scan: {lastScanned}</small>}
-          {deviceList.length > 0 && (
+          {(deviceList.length > 0 || summary) && (
             <>
+              <button
+                onClick={() => {
+                  if (!summary && !isGeneratingSummary) {
+                    generateAiSummary();
+                  }
+                  setShowSummaryModal(true);
+                }}
+                style={{
+                  background: summary
+                    ? "linear-gradient(135deg, #0e2a1d 0%, #153825 100%)"
+                    : isGeneratingSummary
+                    ? "#14263a"
+                    : "#172335",
+                  color: summary ? "#4ade80" : isGeneratingSummary ? "#93c5fd" : "#cbd5e1",
+                  border: `1px solid ${summary ? "#22c55e" : isGeneratingSummary ? "#3b82f6" : "#283e58"}`,
+                  display: "flex",
+                  alignItems: "center",
+                  gap: "6px"
+                }}
+                title="View & Download Groq AI Network Security Summary"
+              >
+                <span>{isGeneratingSummary ? "⏳" : summary ? "🛡️" : "✨"}</span>
+                <span>
+                  {isGeneratingSummary
+                    ? "Analyzing with Groq..."
+                    : summary
+                    ? "AI Summary & Report"
+                    : "Generate AI Summary"}
+                </span>
+                {summary && (
+                  <span
+                    style={{
+                      background: "#4ade80",
+                      color: "#05130b",
+                      fontSize: "10px",
+                      padding: "1px 6px",
+                      borderRadius: "10px",
+                      fontWeight: 800
+                    }}
+                  >
+                    READY
+                  </span>
+                )}
+              </button>
               <button onClick={exportJSON} style={{ background: "#152233", color: "#62e6a7", border: "1px solid #20354a" }}>
                 Export JSON
               </button>
@@ -1412,6 +1676,172 @@ export default function Home() {
         </div>
       </section>
 
+      {/* 🤖 Groq AI Network Security Summary Banner */}
+      {(isGeneratingSummary || summary || (lastScanned && !busy && deviceList.length > 0)) && (
+        <section
+          style={{
+            background: isGeneratingSummary
+              ? "linear-gradient(90deg, #091726 0%, #0d2238 100%)"
+              : summary
+              ? "linear-gradient(90deg, #071c14 0%, #0c2b1e 100%)"
+              : "linear-gradient(90deg, #0d1624 0%, #131e30 100%)",
+            border: `1px solid ${isGeneratingSummary ? "#1e4975" : summary ? "#1f633c" : "#24374f"}`,
+            borderRadius: "12px",
+            padding: "16px 20px",
+            marginBottom: "18px",
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "space-between",
+            flexWrap: "wrap",
+            gap: "14px",
+            boxShadow: "0 10px 25px -5px rgba(0,0,0,0.4)"
+          }}
+        >
+          <div style={{ display: "flex", alignItems: "center", gap: "14px", flex: 1, minWidth: "280px" }}>
+            <span
+              className={isGeneratingSummary ? "pulsing" : ""}
+              style={{
+                fontSize: "24px",
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "center",
+                width: "44px",
+                height: "44px",
+                borderRadius: "10px",
+                background: isGeneratingSummary ? "#132b45" : summary ? "#0f3622" : "#182638",
+                border: `1px solid ${isGeneratingSummary ? "#255380" : summary ? "#227045" : "#283b54"}`
+              }}
+            >
+              {isGeneratingSummary ? "⚡" : summary ? "🛡️" : "✨"}
+            </span>
+            <div>
+              <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
+                <h3 style={{ margin: 0, fontSize: "15px", color: "#fff", fontWeight: 700 }}>
+                  {isGeneratingSummary
+                    ? "Groq AI Auditor Scanning Network..."
+                    : summary
+                    ? "AI Network Security Summary & Defensive Audit Ready"
+                    : "Network Scan Finished · AI Security Summary Ready"}
+                </h3>
+                {summary && (
+                  <span
+                    style={{
+                      background: "#22c55e",
+                      color: "#031409",
+                      fontSize: "10px",
+                      fontWeight: 800,
+                      padding: "2px 7px",
+                      borderRadius: "10px"
+                    }}
+                  >
+                    AI AUDIT COMPLETE
+                  </span>
+                )}
+              </div>
+              <p style={{ margin: "4px 0 0", fontSize: "12.5px", color: "#8fa2b8" }}>
+                {isGeneratingSummary
+                  ? `Analyzing ${deviceList.length} devices, open ports & host vulnerabilities using ${selectedGroqModel}...`
+                  : summary
+                  ? `Analyzed ${summaryMeta?.deviceCount || deviceList.length} systems and ${summaryMeta?.portCount || stats.ports} exposed ports via ${summaryMeta?.model || selectedGroqModel}. Ready to download.`
+                  : `Discovered ${deviceList.length} active devices on ${cidr}. Click to generate defensive security advice and executive breakdown.`}
+              </p>
+            </div>
+          </div>
+
+          <div style={{ display: "flex", gap: "8px", alignItems: "center", flexWrap: "wrap" }}>
+            {summary && (
+              <>
+                <button
+                  onClick={() => setShowSummaryModal(true)}
+                  style={{
+                    background: "#22c55e",
+                    color: "#031409",
+                    fontWeight: 800,
+                    padding: "9px 16px",
+                    fontSize: "12px",
+                    borderRadius: "8px",
+                    display: "flex",
+                    alignItems: "center",
+                    gap: "6px"
+                  }}
+                >
+                  <span>📊</span> View Full Summary
+                </button>
+                <button
+                  onClick={downloadSummaryMarkdown}
+                  style={{
+                    background: "#0d2b1c",
+                    color: "#62e6a7",
+                    border: "1px solid #1e633d",
+                    padding: "9px 13px",
+                    fontSize: "12px",
+                    borderRadius: "8px",
+                    display: "flex",
+                    alignItems: "center",
+                    gap: "6px"
+                  }}
+                  title="Download Markdown Report (.md)"
+                >
+                  <span>📥</span> Download .md
+                </button>
+                <button
+                  onClick={downloadSummaryTxt}
+                  style={{
+                    background: "#132130",
+                    color: "#cbd5e1",
+                    border: "1px solid #23374d",
+                    padding: "9px 12px",
+                    fontSize: "12px",
+                    borderRadius: "8px"
+                  }}
+                  title="Download Text File (.txt)"
+                >
+                  📄 .txt
+                </button>
+              </>
+            )}
+
+            {!summary && !isGeneratingSummary && (
+              <button
+                onClick={() => generateAiSummary()}
+                style={{
+                  background: "#3b82f6",
+                  color: "#fff",
+                  fontWeight: 700,
+                  padding: "9px 16px",
+                  fontSize: "12px",
+                  borderRadius: "8px",
+                  display: "flex",
+                  alignItems: "center",
+                  gap: "6px"
+                }}
+              >
+                <span>✨</span> Generate Groq AI Summary
+              </button>
+            )}
+
+            {isGeneratingSummary && (
+              <div
+                style={{
+                  background: "#102236",
+                  border: "1px solid #1f456e",
+                  color: "#93c5fd",
+                  padding: "8px 14px",
+                  borderRadius: "8px",
+                  fontSize: "12px",
+                  display: "flex",
+                  alignItems: "center",
+                  gap: "8px"
+                }}
+              >
+                <span className="pulsing" style={{ width: "7px", height: "7px", borderRadius: "50%", background: "#60a5fa" }} />
+                <span>Auditing via Groq LLM...</span>
+              </div>
+            )}
+          </div>
+        </section>
+      )}
+
       {/* Active Systems Table */}
       <section className="panel">
         <div className="panelHead">
@@ -1589,6 +2019,373 @@ export default function Home() {
               Re-scan network
             </button>
           </aside>
+        </div>
+      )}
+
+      {/* 🛡️ GROQ AI NETWORK SECURITY SUMMARY & DOWNLOAD MODAL */}
+      {showSummaryModal && (
+        <div className="overlay" onClick={() => setShowSummaryModal(false)}>
+          <div
+            className="summaryModal"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="summaryModalHeader">
+              <div style={{ flex: 1, minWidth: "260px" }}>
+                <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
+                  <span style={{ fontSize: "20px" }}>🛡️</span>
+                  <span style={{ color: "#4ade80", fontSize: "11px", fontWeight: 800, letterSpacing: "0.08em" }}>
+                    GROQ AI DEFENSIVE SECURITY AUDIT & NETWORK SUMMARY
+                  </span>
+                </div>
+                <h2 style={{ fontSize: "24px", margin: "6px 0 3px", color: "#fff" }}>
+                  Network Intelligence & Executive Security Report
+                </h2>
+                <div style={{ color: "#8da0b8", fontSize: "12px", display: "flex", gap: "12px", flexWrap: "wrap", alignItems: "center", marginTop: "4px" }}>
+                  <span>Subnet: <b style={{ color: "#fff" }}>{cidr || profile?.cidr || "192.168.0.0/24"}</b></span>
+                  <span>Devices Analyzed: <b style={{ color: "#4ade80" }}>{summaryMeta?.deviceCount ?? deviceList.length}</b></span>
+                  <span>Model: <code style={{ color: "#93c5fd" }}>{summaryMeta?.model || selectedGroqModel}</code></span>
+                  {summaryMeta?.timestamp && (
+                    <span>Generated: <b style={{ color: "#cbd5e1" }}>{new Date(summaryMeta.timestamp).toLocaleTimeString()}</b></span>
+                  )}
+                </div>
+              </div>
+
+              <div style={{ display: "flex", gap: "8px", alignItems: "center", flexWrap: "wrap" }}>
+                {summary && (
+                  <>
+                    <button
+                      onClick={downloadSummaryMarkdown}
+                      className="actionBtn primary"
+                      title="Download Markdown Report (.md)"
+                    >
+                      <span>📥</span> Download .md
+                    </button>
+                    <button
+                      onClick={downloadSummaryTxt}
+                      className="actionBtn"
+                      title="Download Plain Text Report (.txt)"
+                    >
+                      <span>📄</span> .txt
+                    </button>
+                    <button
+                      onClick={copySummaryToClipboard}
+                      className="actionBtn"
+                      title="Copy Markdown to Clipboard"
+                    >
+                      <span>{copiedText === "summary-copy" ? "✓ Copied!" : "📋 Copy"}</span>
+                    </button>
+                    <button
+                      onClick={exportFullReportJSON}
+                      className="actionBtn"
+                      title="Export Full JSON Bundle (Telemetry + AI Summary)"
+                    >
+                      <span>📦</span> Full JSON
+                    </button>
+                  </>
+                )}
+                <button
+                  onClick={() => setShowGroqSettings(!showGroqSettings)}
+                  className="actionBtn"
+                  style={{ background: showGroqSettings ? "#233c5b" : "#141f2d" }}
+                  title="Configure Groq API Key & Model"
+                >
+                  <span>⚙️ Settings</span>
+                </button>
+                <button
+                  className="close"
+                  onClick={() => setShowSummaryModal(false)}
+                  title="Close summary"
+                >
+                  ×
+                </button>
+              </div>
+            </div>
+
+            {/* Groq Settings Dropdown / Panel */}
+            {showGroqSettings && (
+              <div
+                style={{
+                  background: "#0c1522",
+                  border: "1px solid #1e334d",
+                  borderRadius: "12px",
+                  padding: "16px",
+                  margin: "14px 0"
+                }}
+              >
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "12px", flexWrap: "wrap", gap: "6px" }}>
+                  <h4 style={{ margin: 0, fontSize: "14px", color: "#62e6a7" }}>
+                    ⚡ Groq LLM Configuration & Custom Focus
+                  </h4>
+                  <span style={{ fontSize: "11px", color: "#64748b" }}>
+                    Connected Key: {groqConfigStatus?.maskedKey || "gsk_T5Qr...X0Pi"}
+                  </span>
+                </div>
+
+                <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(240px, 1fr))", gap: "12px" }}>
+                  <div>
+                    <label style={{ display: "block", fontSize: "11px", color: "#8da0b8", marginBottom: "4px", fontWeight: 700 }}>
+                      GROQ API KEY (OPTIONAL OVERRIDE)
+                    </label>
+                    <input
+                      type="password"
+                      value={groqKeyInput}
+                      onChange={(e) => {
+                        setGroqKeyInput(e.target.value);
+                        try {
+                          localStorage.setItem("groq_custom_key", e.target.value);
+                        } catch {}
+                      }}
+                      placeholder="gsk_... (defaults to connected system key)"
+                      style={{
+                        width: "100%",
+                        background: "#060a12",
+                        border: "1px solid #223750",
+                        borderRadius: "7px",
+                        color: "#fff",
+                        padding: "8px 10px",
+                        fontSize: "12px"
+                      }}
+                    />
+                  </div>
+
+                  <div>
+                    <label style={{ display: "block", fontSize: "11px", color: "#8da0b8", marginBottom: "4px", fontWeight: 700 }}>
+                      GROQ MODEL
+                    </label>
+                    <select
+                      value={selectedGroqModel}
+                      onChange={(e) => {
+                        setSelectedGroqModel(e.target.value);
+                        try {
+                          localStorage.setItem("groq_model", e.target.value);
+                        } catch {}
+                      }}
+                      style={{
+                        width: "100%",
+                        background: "#060a12",
+                        border: "1px solid #223750",
+                        borderRadius: "7px",
+                        color: "#fff",
+                        padding: "8px 10px",
+                        fontSize: "12px"
+                      }}
+                    >
+                      <option value="openai/gpt-oss-120b">openai/gpt-oss-120b (Recommended - Deep Reasoning)</option>
+                      <option value="openai/gpt-oss-20b">openai/gpt-oss-20b (Fast & Lightweight)</option>
+                      <option value="qwen/qwen3.8-27b">qwen/qwen3.8-27b (High Accuracy Multilingual)</option>
+                      <option value="qwen/qwen3.6-27b">qwen/qwen3.6-27b (High Speed)</option>
+                      <option value="groq/compound">groq/compound (Multi-Agent)</option>
+                    </select>
+                  </div>
+                </div>
+
+                <div style={{ marginTop: "10px" }}>
+                  <label style={{ display: "block", fontSize: "11px", color: "#8da0b8", marginBottom: "4px", fontWeight: 700 }}>
+                    CUSTOM AUDIT FOCUS OR PROMPT QUESTION (OPTIONAL)
+                  </label>
+                  <input
+                    type="text"
+                    value={customAuditFocus}
+                    onChange={(e) => setCustomAuditFocus(e.target.value)}
+                    placeholder="e.g. Highlight smart home IoT vulnerabilities, or investigate open SSH/HTTP services"
+                    style={{
+                      width: "100%",
+                      background: "#060a12",
+                      border: "1px solid #223750",
+                      borderRadius: "7px",
+                      color: "#fff",
+                      padding: "8px 10px",
+                      fontSize: "12px"
+                    }}
+                  />
+                </div>
+
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginTop: "12px", flexWrap: "wrap", gap: "10px" }}>
+                  <label style={{ display: "flex", alignItems: "center", gap: "8px", fontSize: "12px", color: "#94a3b8", cursor: "pointer" }}>
+                    <input
+                      type="checkbox"
+                      checked={autoSummaryEnabled}
+                      onChange={(e) => {
+                        setAutoSummaryEnabled(e.target.checked);
+                        try {
+                          localStorage.setItem("groq_auto_summary", String(e.target.checked));
+                        } catch {}
+                      }}
+                    />
+                    <span>Automatically generate AI summary after each network scan</span>
+                  </label>
+
+                  <button
+                    onClick={() => {
+                      generateAiSummary();
+                      setShowGroqSettings(false);
+                    }}
+                    disabled={isGeneratingSummary}
+                    style={{
+                      background: "#4ade80",
+                      color: "#05130b",
+                      padding: "7px 14px",
+                      borderRadius: "6px",
+                      fontSize: "12px",
+                      fontWeight: 700
+                    }}
+                  >
+                    {isGeneratingSummary ? "Generating..." : "Apply & Run Summary"}
+                  </button>
+                </div>
+              </div>
+            )}
+
+            {/* Error Message */}
+            {summaryError && (
+              <div
+                style={{
+                  background: "#2a1212",
+                  border: "1px solid #5c2424",
+                  borderRadius: "10px",
+                  padding: "14px 16px",
+                  margin: "14px 0",
+                  color: "#ff9c9c",
+                  fontSize: "13px",
+                  display: "flex",
+                  justifyContent: "space-between",
+                  alignItems: "center"
+                }}
+              >
+                <div>
+                  <b>Summary Generation Failed:</b> {summaryError}
+                </div>
+                <button
+                  onClick={() => generateAiSummary()}
+                  style={{ background: "#471d1d", color: "#ffc2c2", border: "1px solid #6b2e2e", padding: "6px 12px", fontSize: "12px" }}
+                >
+                  Retry
+                </button>
+              </div>
+            )}
+
+            {/* Generating Loading State */}
+            {isGeneratingSummary && (
+              <div
+                style={{
+                  padding: "48px 24px",
+                  textAlign: "center",
+                  background: "#080e18",
+                  borderRadius: "14px",
+                  border: "1px solid #1b2a3d",
+                  margin: "16px 0"
+                }}
+              >
+                <div style={{ fontSize: "36px", marginBottom: "14px" }} className="pulsing">
+                  ⚡
+                </div>
+                <h3 style={{ color: "#fff", fontSize: "18px", margin: "0 0 8px" }}>
+                  Generating Comprehensive Network Security Audit...
+                </h3>
+                <p style={{ color: "#8da0b8", fontSize: "13px", maxWidth: "480px", margin: "0 auto 18px", lineHeight: "1.5" }}>
+                  Groq LLM (<code>{selectedGroqModel}</code>) is evaluating {deviceList.length} discovered systems, analyzing open port exposure, and drafting prioritized defensive hardening steps.
+                </p>
+                <div
+                  style={{
+                    height: "4px",
+                    background: "#162334",
+                    borderRadius: "2px",
+                    maxWidth: "320px",
+                    margin: "0 auto",
+                    overflow: "hidden"
+                  }}
+                >
+                  <div
+                    className="pulsing"
+                    style={{
+                      height: "100%",
+                      width: "100%",
+                      background: "linear-gradient(90deg, #3b82f6, #4ade80)"
+                    }}
+                  />
+                </div>
+              </div>
+            )}
+
+            {/* Rendered Markdown Report */}
+            {!isGeneratingSummary && summary && (
+              <div
+                style={{
+                  marginTop: "16px",
+                  padding: "20px 24px",
+                  background: "#060910",
+                  border: "1px solid #162436",
+                  borderRadius: "14px",
+                  maxHeight: "65vh",
+                  overflowY: "auto"
+                }}
+              >
+                <MarkdownRenderer content={summary} />
+              </div>
+            )}
+
+            {!isGeneratingSummary && !summary && !summaryError && (
+              <div
+                style={{
+                  padding: "48px 24px",
+                  textAlign: "center",
+                  color: "#8da0b8",
+                  fontSize: "13px"
+                }}
+              >
+                <span style={{ fontSize: "32px", display: "block", marginBottom: "12px" }}>🌐</span>
+                No AI summary generated yet. Click below to analyze current network telemetry.
+                <div style={{ marginTop: "16px" }}>
+                  <button
+                    onClick={() => generateAiSummary()}
+                    style={{ background: "#4ade80", color: "#05130b", fontWeight: 700, padding: "10px 20px" }}
+                  >
+                    ✨ Generate AI Security Summary
+                  </button>
+                </div>
+              </div>
+            )}
+
+            {/* Modal Footer with Quick Download Bar */}
+            {summary && (
+              <div
+                style={{
+                  marginTop: "18px",
+                  paddingTop: "14px",
+                  borderTop: "1px solid #1c2b3e",
+                  display: "flex",
+                  justifyContent: "space-between",
+                  alignItems: "center",
+                  flexWrap: "wrap",
+                  gap: "10px"
+                }}
+              >
+                <div style={{ fontSize: "12px", color: "#64748b" }}>
+                  💡 Tip: The downloaded Markdown report can be viewed in Obsidian, Notion, VS Code, or GitHub.
+                </div>
+                <div style={{ display: "flex", gap: "8px" }}>
+                  <button
+                    onClick={downloadSummaryMarkdown}
+                    className="actionBtn primary"
+                  >
+                    <span>📥</span> Download Markdown (.md)
+                  </button>
+                  <button
+                    onClick={downloadSummaryTxt}
+                    className="actionBtn"
+                  >
+                    <span>📄</span> Download Text (.txt)
+                  </button>
+                  <button
+                    onClick={() => setShowSummaryModal(false)}
+                    className="actionBtn"
+                  >
+                    Done
+                  </button>
+                </div>
+              </div>
+            )}
+          </div>
         </div>
       )}
 

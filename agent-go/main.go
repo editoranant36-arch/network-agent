@@ -6,6 +6,7 @@ import (
 	"crypto/tls"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"os"
@@ -1023,6 +1024,271 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+const defaultGroqModel = "openai/gpt-oss-120b"
+
+var supportedGroqModels = []string{
+	"openai/gpt-oss-120b",
+	"openai/gpt-oss-20b",
+	"qwen/qwen3.8-27b",
+	"qwen/qwen3.6-27b",
+	"groq/compound",
+}
+
+func getGroqAPIKey() string {
+	if k := os.Getenv("GROQ_API_KEY"); k != "" {
+		return k
+	}
+	for _, p := range []string{".env", "../.env", "../dashboard/.env.local", "dashboard/.env.local", ".env.local"} {
+		if content, err := os.ReadFile(p); err == nil {
+			for _, line := range strings.Split(string(content), "\n") {
+				line = strings.TrimSpace(line)
+				if strings.HasPrefix(line, "GROQ_API_KEY=") {
+					val := strings.TrimPrefix(line, "GROQ_API_KEY=")
+					val = strings.Trim(val, `"' `)
+					if val != "" && !strings.Contains(val, "your_") {
+						return val
+					}
+				}
+			}
+		}
+	}
+	return ""
+}
+
+func getGroqModel() string {
+	if m := os.Getenv("GROQ_MODEL"); m != "" {
+		return m
+	}
+	for _, p := range []string{".env", "../.env", "../dashboard/.env.local", "dashboard/.env.local", ".env.local"} {
+		if content, err := os.ReadFile(p); err == nil {
+			for _, line := range strings.Split(string(content), "\n") {
+				line = strings.TrimSpace(line)
+				if strings.HasPrefix(line, "GROQ_MODEL=") {
+					val := strings.TrimPrefix(line, "GROQ_MODEL=")
+					val = strings.Trim(val, `"' `)
+					if val != "" {
+						return val
+					}
+				}
+			}
+		}
+	}
+	return defaultGroqModel
+}
+
+type summaryRequest struct {
+	APIKey  string   `json:"apiKey,omitempty"`
+	Model   string   `json:"model,omitempty"`
+	Prompt  string   `json:"prompt,omitempty"`
+	Devices []Device `json:"devices,omitempty"`
+}
+
+func summaryHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	if r.Method == http.MethodOptions {
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+
+	apiKey := getGroqAPIKey()
+
+	if r.Method == http.MethodGet {
+		isConfigured := strings.HasPrefix(apiKey, "gsk_")
+		masked := "Not configured"
+		if isConfigured && len(apiKey) > 12 {
+			masked = apiKey[:8] + "..." + apiKey[len(apiKey)-4:]
+		}
+		json.NewEncoder(w).Encode(map[string]any{
+			"status":          "ok",
+			"configured":      isConfigured,
+			"maskedKey":       masked,
+			"currentModel":    getGroqModel(),
+			"availableModels": supportedGroqModels,
+		})
+		return
+	}
+
+	if r.Method != http.MethodPost {
+		http.Error(w, `{"error":"Method not allowed"}`, http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req summaryRequest
+	_ = json.NewDecoder(r.Body).Decode(&req)
+
+	if req.APIKey != "" && strings.HasPrefix(req.APIKey, "gsk_") {
+		apiKey = strings.TrimSpace(req.APIKey)
+	} else if authHeader := r.Header.Get("Authorization"); strings.HasPrefix(authHeader, "Bearer ") {
+		token := strings.TrimPrefix(authHeader, "Bearer ")
+		if strings.HasPrefix(token, "gsk_") {
+			apiKey = strings.TrimSpace(token)
+		}
+	}
+
+	if apiKey == "" {
+		http.Error(w, `{"error":"Groq API key not configured"}`, http.StatusBadRequest)
+		return
+	}
+
+	requestedModel := req.Model
+	if requestedModel == "" {
+		requestedModel = getGroqModel()
+	}
+
+	var scanDevices []Device
+	if len(req.Devices) > 0 {
+		scanDevices = req.Devices
+	} else {
+		mu.RLock()
+		scanDevices = make([]Device, len(devices))
+		copy(scanDevices, devices)
+		mu.RUnlock()
+	}
+
+	cidr, gw := detectLocalSubnet()
+	totalOpenPorts := 0
+	deviceBreakdown := ""
+	for i, d := range scanDevices {
+		totalOpenPorts += len(d.OpenPorts)
+		portsStr := "None"
+		if len(d.OpenPorts) > 0 {
+			var pStrs []string
+			for _, p := range d.OpenPorts {
+				pStrs = append(pStrs, strconv.Itoa(int(p)))
+			}
+			portsStr = strings.Join(pStrs, ", ")
+		}
+		pingStr := "N/A"
+		if d.PingMS != nil {
+			pingStr = fmt.Sprintf("%dms", *d.PingMS)
+		}
+		deviceBreakdown += fmt.Sprintf("Device #%d:\n  - IP: %s\n  - Hostname: %s\n  - Vendor: %s\n  - MAC: %s\n  - Ping: %s\n  - Reachable: %t\n  - Open Ports: [%s]\n\n",
+			i+1, d.IP, d.Hostname, d.Vendor, d.MAC, pingStr, d.Reachable, portsStr)
+	}
+
+	systemPrompt := `You are LAN Sentinel AI, a senior network security auditor and systems architect.
+Your mission is to examine network telemetry and live discovery scans from the local agent and generate a comprehensive, highly detailed network summary and defensive security assessment.
+
+Guidelines for formatting your response:
+- Use clean GitHub-flavored Markdown.
+- Use structured headings, emoji indicators, bullet points, and data tables where helpful.
+- Provide a rigorous, in-depth breakdown covering:
+  1. 🌐 Executive Network Overview & Architecture
+  2. 💻 Device Inventory & Host Categorization
+  3. 🔓 Port Exposure & Attack Surface Analysis
+  4. 🛡️ Defensive Security Recommendations & Hardening Steps
+  5. 📊 Network Hygiene Score (0-100) & Conclusion
+
+Maintain a professional, authoritative, yet accessible cybersecurity tone.`
+
+	userPrompt := fmt.Sprintf(`Please generate an in-depth Network Security Summary for this scan:
+--- NETWORK CONTEXT ---
+Subnet CIDR: %s
+Gateway IP: %s
+Agent Host OS: %s (%s)
+Total Discovered Devices: %d
+Total Exposed Services: %d
+
+--- DEVICE DETAILS ---
+%s
+%s
+Generate the comprehensive security audit report now.`, cidr, gw, runtime.GOOS, runtime.GOARCH, len(scanDevices), totalOpenPorts,
+		func() string {
+			if deviceBreakdown == "" {
+				return "No devices discovered yet (Subnet was empty or initial scan just started)."
+			}
+			return deviceBreakdown
+		}(),
+		func() string {
+			if req.Prompt != "" {
+				return "\n--- CUSTOM USER FOCUS ---\n" + req.Prompt + "\n"
+			}
+			return ""
+		}())
+
+	modelsToTry := []string{requestedModel}
+	for _, m := range supportedGroqModels {
+		if m != requestedModel {
+			modelsToTry = append(modelsToTry, m)
+		}
+	}
+
+	var summaryText string
+	var modelUsed string
+	var lastErr error
+
+	httpClient := &http.Client{Timeout: 45 * time.Second}
+
+	for _, m := range modelsToTry {
+		reqBody := map[string]any{
+			"model": m,
+			"messages": []map[string]string{
+				{"role": "system", "content": systemPrompt},
+				{"role": "user", "content": userPrompt},
+			},
+			"temperature": 0.3,
+			"max_tokens":  4096,
+		}
+		bodyBytes, _ := json.Marshal(reqBody)
+
+		httpReq, err := http.NewRequest(http.MethodPost, "https://api.groq.com/openai/v1/chat/completions", bytes.NewReader(bodyBytes))
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		httpReq.Header.Set("Authorization", "Bearer "+apiKey)
+		httpReq.Header.Set("Content-Type", "application/json")
+
+		resp, err := httpClient.Do(httpReq)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+
+		respBytes, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			lastErr = fmt.Errorf("Groq HTTP %d: %s", resp.StatusCode, string(respBytes))
+			continue
+		}
+
+		var groqResp struct {
+			Choices []struct {
+				Message struct {
+					Content string `json:"content"`
+				} `json:"message"`
+			} `json:"choices"`
+		}
+		if err := json.Unmarshal(respBytes, &groqResp); err == nil && len(groqResp.Choices) > 0 {
+			summaryText = groqResp.Choices[0].Message.Content
+			modelUsed = m
+			break
+		}
+	}
+
+	if summaryText == "" {
+		w.WriteHeader(http.StatusBadGateway)
+		errMsg := "Failed to generate summary from Groq LLM"
+		if lastErr != nil {
+			errMsg = lastErr.Error()
+		}
+		json.NewEncoder(w).Encode(map[string]any{
+			"error": errMsg,
+		})
+		return
+	}
+
+	json.NewEncoder(w).Encode(map[string]any{
+		"success":     true,
+		"summary":     summaryText,
+		"model":       modelUsed,
+		"deviceCount": len(scanDevices),
+		"portCount":   totalOpenPorts,
+		"timestamp":   time.Now().UTC().Format(time.RFC3339),
+	})
+}
+
 func main() {
 	startTime = time.Now()
 
@@ -1033,6 +1299,7 @@ func main() {
 	mux.HandleFunc("/api/devices", devicesHandler)
 	mux.HandleFunc("/api/scan", scanHandler)
 	mux.HandleFunc("/api/scan/stream", scanStreamHandler)
+	mux.HandleFunc("/api/summary", summaryHandler)
 	mux.HandleFunc("/ws", wsHandler)
 
 	handler := corsMiddleware(mux)
